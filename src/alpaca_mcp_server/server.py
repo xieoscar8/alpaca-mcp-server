@@ -88,6 +88,21 @@ def _make_filter(allowed_ops: set[str]):
     return filter_fn
 
 
+def _get_read_operation_ids(spec: dict[str, Any]) -> set[str]:
+    """Return operationIds for GET endpoints only."""
+    return {
+        operation["operationId"]
+        for path_item in spec.get("paths", {}).values()
+        for method, operation in path_item.items()
+        if method.lower() == "get" and isinstance(operation, dict) and "operationId" in operation
+    }
+
+
+def _safe_mode_enabled() -> bool:
+    """Safe mode is on unless it is explicitly disabled with ``false``."""
+    return os.environ.get("ALPACA_SAFE_MODE", "true").strip().lower() != "false"
+
+
 def _make_customizer(descriptions: dict[str, str]):
     """Create an mcp_component_fn that overrides descriptions where provided."""
 
@@ -145,6 +160,7 @@ def build_server(
     """Construct the Alpaca MCP server from OpenAPI specs."""
     active_toolsets = _parse_toolsets()
     spec_ops = get_active_operations(active_toolsets)
+    safe_mode = _safe_mode_enabled()
 
     auth_headers = _build_auth_headers()
     trading_base = _get_trading_base_url()
@@ -176,6 +192,8 @@ def build_server(
     if trading_client is not None:
         allowed = spec_ops["trading"]
         spec = _load_spec("trading-api")
+        if safe_mode:
+            allowed = allowed & _get_read_operation_ids(spec)
         sub = FastMCP.from_openapi(
             spec,
             client=trading_client,
@@ -204,7 +222,10 @@ def build_server(
     active_ts = active_toolsets if active_toolsets is not None else set(TOOLSETS.keys())
 
     if trading_client is not None and "trading" in active_ts:
-        _register_trading_overrides(main, trading_client)
+        if safe_mode:
+            _register_safe_trading_overrides(main, trading_client)
+        else:
+            _register_trading_overrides(main, trading_client)
 
     if data_client is not None and active_ts & {"stock-data", "crypto-data"}:
         _register_market_data_overrides(main, data_client)
@@ -219,6 +240,13 @@ def _register_trading_overrides(server: FastMCP, trading_client: httpx.AsyncClie
     from .overrides import register_order_tools
 
     register_order_tools(server, trading_client)
+
+
+def _register_safe_trading_overrides(server: FastMCP, trading_client: httpx.AsyncClient) -> None:
+    """Register the only write tools permitted by Safe Trading V1."""
+    from .safe_overrides import register_safe_trading_tools
+
+    register_safe_trading_tools(server, trading_client)
 
 
 def _register_market_data_overrides(server: FastMCP, data_client: httpx.AsyncClient) -> None:

@@ -38,6 +38,8 @@ DUMMY_ENV = {
     "ALPACA_API_KEY": "test-key",
     "ALPACA_SECRET_KEY": "test-secret",
     "ALPACA_PAPER_TRADE": "true",
+    # These legacy construction assertions intentionally cover upstream mode.
+    "ALPACA_SAFE_MODE": "false",
 }
 
 EXPECTED_TOOLS = {

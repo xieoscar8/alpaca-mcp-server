@@ -19,6 +19,8 @@ ORDER_ID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[8
 POSITION_ID_RE = re.compile(
     r"^(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|[A-Za-z0-9][A-Za-z0-9.-]*(?:/[A-Za-z0-9][A-Za-z0-9.-]*)?)$"
 )
+STOCK_SYMBOL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*$")
+CRYPTO_SYMBOL_RE = re.compile(r"^[A-Za-z0-9]+/[A-Za-z0-9]+$")
 
 
 def _positive_decimal(value: object, field: str) -> tuple[Decimal | None, dict | None]:
@@ -98,6 +100,16 @@ def _client_order_id(value: str | None) -> tuple[str | None, dict | None]:
     return order_id, None
 
 
+def _valid_symbol(value: object, *, crypto: bool) -> bool:
+    """Apply basic path-safe V1 formatting without asserting asset existence."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        return False
+    if not value.isprintable():
+        return False
+    pattern = CRYPTO_SYMBOL_RE if crypto else STOCK_SYMBOL_RE
+    return pattern.fullmatch(value) is not None
+
+
 def _api_error(message: str, response: httpx.Response, **extra: object) -> dict:
     try:
         detail = response.json()
@@ -142,10 +154,14 @@ def register_safe_trading_tools(server: FastMCP, client: httpx.AsyncClient) -> N
         gate = _paper_gate()
         if gate:
             return gate
+        if not _valid_symbol(symbol, crypto=False):
+            return _error("symbol must be a single path-safe stock symbol")
         if side != "buy":
             return _error("Safe stock orders only allow side=buy")
         if type != "limit":
             return _error("Safe stock orders only allow type=limit")
+        if time_in_force not in {"day", "gtc"}:
+            return _error("Safe stock orders only allow time_in_force=day or gtc")
         if limit_price is None:
             return _error("limit_price is required")
         if (qty is None) == (notional is None):
@@ -187,6 +203,8 @@ def register_safe_trading_tools(server: FastMCP, client: httpx.AsyncClient) -> N
         gate = _paper_gate()
         if gate:
             return gate
+        if not _valid_symbol(symbol, crypto=True):
+            return _error("symbol must be one crypto pair such as BTC/USD")
         if side != "buy":
             return _error("Safe crypto orders only allow side=buy")
         if type != "limit":

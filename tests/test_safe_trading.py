@@ -105,6 +105,38 @@ async def test_stock_rejections_make_no_request(kwargs):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("time_in_force", ["ioc", "fok", "opg", "cls", "DAY", "GTC", " day ", "unknown"])
+async def test_stock_time_in_force_rejections_never_post(time_in_force):
+    tools, client = make_tools()
+    result = await tools["safe_place_stock_order"](
+        "AAPL", "buy", qty="1", limit_price="10", time_in_force=time_in_force
+    )
+    assert "error" in result and client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("time_in_force", ["day", "gtc"])
+async def test_stock_allowed_time_in_force_posts(time_in_force):
+    tools, client = make_tools(FakeClient([(200, {})]))
+    result = await tools["safe_place_stock_order"](
+        "AAPL", "buy", qty="1", limit_price="10", time_in_force=time_in_force
+    )
+    assert "error" not in result
+    assert len(client.calls) == 1
+    assert client.calls[0][2]["json"]["time_in_force"] == time_in_force
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("symbol", ["", " ", " AAPL", "AAPL ", "BRK/B", "*", "AAPL,MSFT", "../AAPL", "AAPL\n"])
+async def test_stock_symbol_rejections_never_post(symbol):
+    tools, client = make_tools()
+    result = await tools["safe_place_stock_order"](
+        symbol, "buy", qty="1", limit_price="10"
+    )
+    assert "error" in result and client.calls == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kwargs", [
     {"side": "sell", "notional": "10", "limit_price": "10"},
     {"side": "buy", "notional": "9.99", "limit_price": "10"},
@@ -124,6 +156,25 @@ async def test_stock_rejections_make_no_request(kwargs):
 async def test_crypto_rejections_make_no_request(kwargs):
     tools, client = make_tools()
     result = await tools["safe_place_crypto_order"]("BTC/USD", **kwargs)
+    assert "error" in result and client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_standard_crypto_pair_is_allowed():
+    tools, client = make_tools(FakeClient([(200, {})]))
+    result = await tools["safe_place_crypto_order"](
+        "BTC/USD", "buy", notional="10", limit_price="10"
+    )
+    assert "error" not in result and len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("symbol", ["", " ", " BTC/USD", "BTC/USD ", "*", "BTC/USD,ETH/USD", "../BTC/USD", "BTC/USD/extra", "BTC//USD", "BTC\n/USD"])
+async def test_crypto_symbol_rejections_never_post(symbol):
+    tools, client = make_tools()
+    result = await tools["safe_place_crypto_order"](
+        symbol, "buy", notional="10", limit_price="10"
+    )
     assert "error" in result and client.calls == []
 
 

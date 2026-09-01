@@ -1,22 +1,34 @@
-"""Pure-local mock tests for Safe Trading V1."""
+"""Pure-local Safe Trading V2 ownership, risk, and self-attack tests."""
 
 from __future__ import annotations
 
+import asyncio
 import json
-from unittest.mock import patch
+from dataclasses import replace
+from decimal import Decimal
 
 import httpx
 import pytest
 
-from alpaca_mcp_server.safe_overrides import register_safe_trading_tools
-from alpaca_mcp_server.server import _safe_mode_enabled, build_server
+from alpaca_mcp_server.reconciliation import reconcile_pending
+from alpaca_mcp_server.risk_store import (
+    ACTIVE_STATUSES,
+    Operation,
+    Reservation,
+    RiskLimitExceeded,
+    RiskStoreError,
+)
+from alpaca_mcp_server.safe_overrides import _limits, _proof, register_safe_trading_tools
+from alpaca_mcp_server.server import build_server
 
-ORDER_ID = "123e4567-e89b-42d3-a456-426614174000"
+ORDER_1 = "123e4567-e89b-42d3-a456-426614174000"
 
 
 @pytest.fixture(autouse=True)
-def paper_mode(monkeypatch):
+def safe_env(monkeypatch):
     monkeypatch.setenv("ALPACA_PAPER_TRADE", "true")
+    monkeypatch.setenv("ALPACA_SAFE_PRINCIPAL", "principal-a")
+    monkeypatch.setenv("ALPACA_SAFE_OWNERSHIP_SECRET", "test-secret-not-production")
 
 
 class CaptureServer:
@@ -27,341 +39,698 @@ class CaptureServer:
         def decorator(fn):
             self.tools[fn.__name__] = fn
             return fn
+
         return decorator
 
 
 class FakeClient:
-    def __init__(self, responses=None, timeout_method=None):
-        self.responses = list(responses or [])
-        self.timeout_method = timeout_method
+    def __init__(self):
         self.calls = []
+        self.post_timeout = False
+        self.delete_timeout = False
+        self.get_timeout = False
+        self.post_status = 200
+        self.delete_status = 204
+        self.get_status = 200
+        self.get_payload = {}
 
-    async def _call(self, method, path, **kwargs):
-        self.calls.append((method, path, kwargs))
-        if method == self.timeout_method:
+    async def post(self, path, **kwargs):
+        self.calls.append(("POST", path, kwargs))
+        if self.post_timeout:
             raise httpx.ReadTimeout("timeout")
-        status, payload = self.responses.pop(0) if self.responses else (200, {})
-        return httpx.Response(status, content=json.dumps(payload).encode())
+        body = kwargs["json"]
+        payload = {"id": ORDER_1, "client_order_id": body["client_order_id"]}
+        return httpx.Response(self.post_status, content=json.dumps(payload).encode())
 
-    async def get(self, path, **kwargs): return await self._call("GET", path, **kwargs)
-    async def post(self, path, **kwargs): return await self._call("POST", path, **kwargs)
-    async def delete(self, path, **kwargs): return await self._call("DELETE", path, **kwargs)
+    async def get(self, path, **kwargs):
+        self.calls.append(("GET", path, kwargs))
+        if self.get_timeout:
+            raise httpx.ReadTimeout("timeout")
+        return httpx.Response(self.get_status, content=json.dumps(self.get_payload).encode())
+
+    async def delete(self, path, **kwargs):
+        self.calls.append(("DELETE", path, kwargs))
+        if self.delete_timeout:
+            raise httpx.ReadTimeout("timeout")
+        return httpx.Response(self.delete_status, content=b"")
 
 
-def make_tools(client=None):
+class FakeStore:
+    def __init__(self, rows=None, lock=None):
+        self.rows = rows if rows is not None else {}
+        self.lock = lock or asyncio.Lock()
+        self.unavailable = False
+        self.transaction_failure = False
+
+    async def open(self):
+        pass
+
+    async def close(self):
+        pass
+
+    async def reserve(self, **kwargs):
+        if self.unavailable:
+            raise RiskStoreError("unavailable")
+        async with self.lock:
+            if self.transaction_failure:
+                raise RiskStoreError("transaction")
+            identity = (kwargs["principal"], kwargs["strategy_id"], kwargs["idempotency_key"])
+            for row in self.rows.values():
+                if (row.principal, row.strategy_id, row.idempotency_key) == identity:
+                    if (
+                        row.client_order_id != kwargs["client_order_id"]
+                        or row.symbol != kwargs["symbol"]
+                        or row.requested_notional != kwargs["requested_notional"]
+                    ):
+                        raise RiskStoreError("idempotency mismatch")
+                    return Reservation(row, False)
+            active = [r for r in self.rows.values() if r.status in ACTIVE_STATUSES]
+            limits = kwargs["limits"]
+            amount = kwargs["requested_notional"]
+            if len(active) + 1 > limits.max_open_orders:
+                raise RiskLimitExceeded("open orders")
+            if (
+                sum((r.reserved_notional for r in active), Decimal(0)) + amount
+                > limits.max_open_notional
+            ):
+                raise RiskLimitExceeded("open notional")
+            symbol_total = sum(
+                (r.reserved_notional for r in active if r.symbol == kwargs["symbol"]), Decimal(0)
+            )
+            if symbol_total + amount > limits.max_symbol_open_notional:
+                raise RiskLimitExceeded("symbol notional")
+            daily = sum(
+                (r.requested_notional for r in self.rows.values() if r.status != "rejected"),
+                Decimal(0),
+            )
+            if daily + amount > limits.max_daily_submitted_notional:
+                raise RiskLimitExceeded("daily notional")
+            row = Operation(
+                kwargs["principal"],
+                kwargs["strategy_id"],
+                kwargs["idempotency_key"],
+                kwargs["client_order_id"],
+                None,
+                kwargs["symbol"],
+                kwargs["asset_type"],
+                amount,
+                amount,
+                "reserved",
+                False,
+            )
+            self.rows[row.client_order_id] = row
+            return Reservation(row, True)
+
+    async def _set(self, key, **changes):
+        if self.unavailable:
+            raise RiskStoreError("unavailable")
+        row = self.rows.get(key)
+        if row is None:
+            raise RiskStoreError("missing")
+        row = replace(row, **changes)
+        self.rows[key] = row
+        return row
+
+    async def mark_submitted(self, key, order_id):
+        return await self._set(key, order_id=order_id, status="submitted")
+
+    async def mark_uncertain(self, key):
+        await self._set(key, status="uncertain", uncertain=True)
+
+    async def mark_rejected(self, key):
+        await self._set(key, status="rejected", reserved_notional=Decimal(0))
+
+    async def get_by_client_order_id(self, key):
+        if self.unavailable:
+            raise RiskStoreError("unavailable")
+        return self.rows.get(key)
+
+    async def list_reconcilable(self, principal=None):
+        if self.unavailable:
+            raise RiskStoreError("unavailable")
+        return [
+            row
+            for row in self.rows.values()
+            if row.status in ACTIVE_STATUSES and (principal is None or row.principal == principal)
+        ]
+
+    async def reconcile_uncertain_order(self, key, order_id):
+        row = self.rows.get(key)
+        if row is None or row.status != "uncertain" or row.order_id is not None:
+            raise RiskStoreError("not reconcilable")
+        return await self._set(key, order_id=order_id, status="submitted", uncertain=False)
+
+    async def reconcile_verified(self, operation, *, order_id, broker_status, target_status):
+        async with self.lock:
+            current = self.rows.get(operation.client_order_id)
+            if (
+                current is None
+                or current.status not in ACTIVE_STATUSES
+                or current.principal != operation.principal
+                or current.strategy_id != operation.strategy_id
+                or current.symbol != operation.symbol
+                or (current.order_id is not None and current.order_id != order_id)
+            ):
+                raise RiskStoreError("mismatch")
+            terminal = target_status in {"filled", "expired", "cancelled", "rejected"}
+            return await self._set(
+                operation.client_order_id,
+                order_id=order_id,
+                broker_status=broker_status,
+                status=target_status,
+                uncertain=False,
+                reserved_notional=Decimal(0) if terminal else current.reserved_notional,
+            )
+
+    async def mark_cancelled(self, key):
+        await self._set(key, status="cancelled", reserved_notional=Decimal(0))
+
+    async def mark_cancel_uncertain(self, key):
+        await self._set(key, status="cancel_uncertain", uncertain=True)
+
+
+def make_tools(
+    client=None, store=None, principal="principal-a", secret="test-secret-not-production"
+):
     server = CaptureServer()
     client = client or FakeClient()
-    register_safe_trading_tools(server, client)
-    return server.tools, client
+    store = store or FakeStore()
+    register_safe_trading_tools(
+        server,
+        client,
+        store,
+        principal_provider=lambda: principal,
+        ownership_secret=secret,
+        reconcile_before_write=False,
+    )
+    return server.tools, client, store
 
 
-def test_safe_mode_defaults_on_and_only_explicit_false_disables():
-    with patch.dict("os.environ", {}, clear=True): assert _safe_mode_enabled()
-    with patch.dict("os.environ", {"ALPACA_SAFE_MODE": "0"}, clear=True): assert _safe_mode_enabled()
-    with patch.dict("os.environ", {"ALPACA_SAFE_MODE": "false"}, clear=True): assert not _safe_mode_enabled()
+async def place(tools, *, key="key-1", strategy="strategy-1", symbol="AAPL", notional="50"):
+    return await tools["safe_place_stock_order"](
+        symbol, "buy", strategy, key, notional=notional, limit_price="10"
+    )
 
 
 @pytest.mark.asyncio
-async def test_safe_registry_hides_dangerous_writes_and_keeps_reads(monkeypatch):
+async def test_only_three_v2_writes_are_exposed(monkeypatch):
     monkeypatch.delenv("ALPACA_SAFE_MODE", raising=False)
-    names = {t.name for t in await build_server().list_tools()}
-    assert {"safe_place_stock_order", "safe_place_crypto_order", "safe_cancel_order", "safe_close_position"} <= names
-    assert {"get_account_info", "get_account_config", "get_orders", "get_open_position", "get_clock", "get_stock_bars"} <= names
-    assert not ({"cancel_all_orders", "close_all_positions", "replace_order_by_id", "update_account_config",
-                 "place_stock_order", "place_crypto_order", "place_option_order", "exercise_options_position",
-                 "do_not_exercise_options_position", "create_watchlist", "create_locate"} & names)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("kwargs", [
-    {"side": "sell", "qty": "1", "limit_price": "10"},
-    {"side": "buy", "qty": "1", "limit_price": "10", "type": "market"},
-    {"side": "buy", "qty": "11", "limit_price": "10"},
-    {"side": "buy", "qty": "NaN", "limit_price": "10"},
-    {"side": "buy", "qty": "Infinity", "limit_price": "10"},
-    {"side": "buy", "qty": "wat", "limit_price": "10"},
-    {"side": "SELL", "qty": "1", "limit_price": "10"},
-    {"side": " sell ", "qty": "1", "limit_price": "10"},
-    {"side": "buy", "qty": "1", "limit_price": "10", "type": "MARKET"},
-    {"side": "buy", "qty": "1", "limit_price": "10", "type": "stop"},
-    {"side": "buy", "qty": "1", "limit_price": "10", "type": "stop_limit"},
-    {"side": "buy", "qty": "1", "limit_price": "10", "type": "trailing_stop"},
-    {"side": "buy", "qty": "1", "notional": "10", "limit_price": "10"},
-    {"side": "buy", "limit_price": "10"},
-    {"side": "buy", "qty": "0", "limit_price": "10"},
-    {"side": "buy", "qty": "-1", "limit_price": "10"},
-    {"side": "buy", "qty": "1", "limit_price": "0"},
-    {"side": "buy", "qty": "1", "limit_price": "-1"},
-    {"side": "buy", "qty": "1", "limit_price": "NaN"},
-    {"side": "buy", "qty": " 1 ", "limit_price": "10"},
-    {"side": "buy", "qty": "1", "limit_price": " 10 "},
-    {"side": "buy", "qty": "1", "limit_price": "100.000001"},
-    {"side": "buy", "qty": "1e100000", "limit_price": "1"},
-])
-async def test_stock_rejections_make_no_request(kwargs):
-    tools, client = make_tools()
-    result = await tools["safe_place_stock_order"]("AAPL", **kwargs)
-    assert "error" in result and client.calls == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("time_in_force", ["ioc", "fok", "opg", "cls", "DAY", "GTC", " day ", "unknown"])
-async def test_stock_time_in_force_rejections_never_post(time_in_force):
-    tools, client = make_tools()
-    result = await tools["safe_place_stock_order"](
-        "AAPL", "buy", qty="1", limit_price="10", time_in_force=time_in_force
+    names = {tool.name for tool in await build_server().list_tools()}
+    assert {"safe_place_stock_order", "safe_place_crypto_order", "safe_cancel_order"} <= names
+    assert "safe_close_position" not in names
+    assert not (
+        {
+            "place_stock_order",
+            "place_crypto_order",
+            "place_option_order",
+            "cancel_all_orders",
+            "close_position",
+            "close_all_positions",
+            "replace_order_by_id",
+            "update_account_config",
+        }
+        & names
     )
-    assert "error" in result and client.calls == []
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("time_in_force", ["day", "gtc"])
-async def test_stock_allowed_time_in_force_posts(time_in_force):
-    tools, client = make_tools(FakeClient([(200, {})]))
-    result = await tools["safe_place_stock_order"](
-        "AAPL", "buy", qty="1", limit_price="10", time_in_force=time_in_force
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"side": "sell", "notional": "10", "limit_price": "10"},
+        {"side": "buy", "notional": "10", "limit_price": "10", "type": "market"},
+        {"side": "buy", "notional": "10", "limit_price": "10", "time_in_force": "ioc"},
+        {"side": "buy", "notional": "100.01", "limit_price": "10"},
+        {"side": "buy", "notional": "NaN", "limit_price": "10"},
+        {"side": "buy", "notional": "10", "limit_price": " 10"},
+    ],
+)
+async def test_v1_stock_validation_regression(kwargs):
+    tools, client, _ = make_tools()
+    result = await tools["safe_place_stock_order"]("AAPL", kwargs.pop("side"), "s", "k", **kwargs)
+    assert "error" in result and not client.calls
+
+
+@pytest.mark.asyncio
+async def test_same_idempotency_key_posts_once_and_replays():
+    tools, client, store = make_tools()
+    first = await place(tools)
+    second = await place(tools)
+    assert "error" not in first and second["idempotent_replay"]
+    assert [c[0] for c in client.calls].count("POST") == 1 and len(store.rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_idempotency_reuse_with_changed_inputs_fails_closed():
+    tools, client, _ = make_tools()
+    await place(tools)
+    result = await place(tools, symbol="MSFT")
+    assert "error" in result and [c[0] for c in client.calls].count("POST") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", [" key", "key ", "key\n", "*", "a/b"])
+async def test_idempotency_format_attacks_post_zero(key):
+    tools, client, _ = make_tools()
+    assert "error" in await place(tools, key=key)
+    assert not client.calls
+
+
+@pytest.mark.asyncio
+async def test_restart_reconstructs_idempotency():
+    shared = {}
+    lock = asyncio.Lock()
+    tools, client, _ = make_tools(store=FakeStore(shared, lock))
+    await place(tools)
+    restarted, client2, _ = make_tools(store=FakeStore(shared, lock))
+    result = await place(restarted)
+    assert result["idempotent_replay"] and not client2.calls and len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["unavailable", "transaction_failure"])
+async def test_store_failure_posts_zero(failure):
+    store = FakeStore()
+    setattr(store, failure, True)
+    tools, client, _ = make_tools(store=store)
+    assert "error" in await place(tools) and not client.calls
+
+
+@pytest.mark.asyncio
+async def test_open_order_and_open_notional_limits():
+    tools, client, _ = make_tools()
+    for i in range(5):
+        await place(tools, key=f"k-{i}", symbol=f"S{i}", notional="60")
+    rejected = await place(tools, key="k-6", symbol="S6", notional="1")
+    assert "error" in rejected and [c[0] for c in client.calls].count("POST") == 5
+
+
+@pytest.mark.asyncio
+async def test_symbol_open_notional_limit():
+    tools, client, _ = make_tools()
+    await place(tools, key="a", notional="100")
+    await place(tools, key="b", notional="100")
+    assert "error" in await place(tools, key="c", notional="1")
+    assert [c[0] for c in client.calls].count("POST") == 2
+
+
+@pytest.mark.asyncio
+async def test_daily_limit_survives_cancelled_rows(monkeypatch):
+    monkeypatch.setenv("ALPACA_SAFE_MAX_DAILY_SUBMITTED_NOTIONAL", "100")
+    tools, client, store = make_tools()
+    await place(tools, notional="100")
+    key = next(iter(store.rows))
+    await store.mark_cancelled(key)
+    assert "error" in await place(tools, key="next", symbol="MSFT", notional="1")
+    assert [c[0] for c in client.calls].count("POST") == 1
+
+
+@pytest.mark.asyncio
+async def test_absolute_daily_500_ceiling():
+    tools, client, store = make_tools()
+    for i in range(5):
+        await place(tools, key=f"daily-{i}", symbol=f"D{i}", notional="100")
+        await store.mark_cancelled(next(reversed(store.rows)))
+    assert "error" in await place(tools, key="daily-6", symbol="D6", notional="1")
+    assert [c[0] for c in client.calls].count("POST") == 5
+
+
+@pytest.mark.asyncio
+async def test_concurrent_requests_do_not_oversubscribe(monkeypatch):
+    monkeypatch.setenv("ALPACA_SAFE_MAX_OPEN_NOTIONAL", "100")
+    tools, client, _ = make_tools()
+    results = await asyncio.gather(
+        *(place(tools, key=f"k{i}", symbol=f"S{i}", notional="60") for i in range(10))
     )
+    assert sum("error" not in r for r in results) == 1
+    assert [c[0] for c in client.calls].count("POST") == 1
+
+
+@pytest.mark.asyncio
+async def test_post_timeout_one_call_and_uncertain_reservation():
+    tools, client, store = make_tools()
+    client.post_timeout = True
+    result = await place(tools)
+    row = next(iter(store.rows.values()))
+    assert (
+        result["uncertain"] and row.status == "uncertain" and row.reserved_notional == Decimal(50)
+    )
+    assert [c[0] for c in client.calls] == ["POST"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [408, 500, 502, 503, 504])
+async def test_uncertain_post_responses_do_not_release_reservation(status):
+    tools, client, store = make_tools()
+    client.post_status = status
+    result = await place(tools)
+    row = next(iter(store.rows.values()))
+    assert result["uncertain"] and result["http_status"] == status
+    assert row.status == "uncertain" and row.reserved_notional == Decimal(50)
+    assert [c[0] for c in client.calls] == ["POST"]
+
+
+@pytest.mark.asyncio
+async def test_definitive_client_rejection_releases_reservation():
+    tools, client, store = make_tools()
+    client.post_status = 422
+    result = await place(tools)
+    row = next(iter(store.rows.values()))
+    assert "error" in result and not result.get("uncertain", False)
+    assert row.status == "rejected" and row.reserved_notional == Decimal(0)
+
+
+@pytest.mark.asyncio
+async def test_restart_reconciles_uncertain_owned_order_for_cancel():
+    shared = {}
+    first, client, _ = make_tools(store=FakeStore(shared))
+    client.post_timeout = True
+    timeout = await place(first)
+    client_id = timeout["client_order_id"]
+    restarted, client2, store2 = make_tools(store=FakeStore(shared))
+    client2.get_payload = {"id": ORDER_1, "client_order_id": client_id}
+    result = await restarted["safe_cancel_order"](ORDER_1, "strategy-1")
     assert "error" not in result
-    assert len(client.calls) == 1
-    assert client.calls[0][2]["json"]["time_in_force"] == time_in_force
+    assert [c[0] for c in client2.calls] == ["GET", "DELETE"]
+    assert store2.rows[client_id].status == "cancelled"
+
+
+async def owned_order():
+    tools, client, store = make_tools()
+    await place(tools)
+    row = next(iter(store.rows.values()))
+    client.calls.clear()
+    client.get_payload = {"id": ORDER_1, "client_order_id": row.client_order_id}
+    return tools, client, store, row
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("symbol", ["", " ", " AAPL", "AAPL ", "BRK/B", "*", "AAPL,MSFT", "../AAPL", "AAPL\n"])
-async def test_stock_symbol_rejections_never_post(symbol):
-    tools, client = make_tools()
-    result = await tools["safe_place_stock_order"](
-        symbol, "buy", qty="1", limit_price="10"
-    )
-    assert "error" in result and client.calls == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("kwargs", [
-    {"side": "sell", "notional": "10", "limit_price": "10"},
-    {"side": "buy", "notional": "9.99", "limit_price": "10"},
-    {"side": "buy", "notional": "100.01", "limit_price": "10"},
-    {"side": "buy", "notional": "10", "limit_price": "10", "type": "market"},
-    {"side": "buy", "notional": "10", "limit_price": "10", "type": "stop_limit"},
-    {"side": "buy", "notional": "10", "limit_price": "10", "time_in_force": "day"},
-    {"side": "buy", "notional": "10", "limit_price": "10", "time_in_force": "fok"},
-    {"side": "buy", "qty": "1", "notional": "10", "limit_price": "10"},
-    {"side": "buy", "limit_price": "10"},
-    {"side": "buy", "notional": "NaN", "limit_price": "10"},
-    {"side": "buy", "notional": "Infinity", "limit_price": "10"},
-    {"side": "buy", "notional": "0", "limit_price": "10"},
-    {"side": "buy", "notional": "-1", "limit_price": "10"},
-    {"side": "buy", "notional": "bad", "limit_price": "10"},
-])
-async def test_crypto_rejections_make_no_request(kwargs):
-    tools, client = make_tools()
-    result = await tools["safe_place_crypto_order"]("BTC/USD", **kwargs)
-    assert "error" in result and client.calls == []
-
-
-@pytest.mark.asyncio
-async def test_standard_crypto_pair_is_allowed():
-    tools, client = make_tools(FakeClient([(200, {})]))
-    result = await tools["safe_place_crypto_order"](
-        "BTC/USD", "buy", notional="10", limit_price="10"
-    )
-    assert "error" not in result and len(client.calls) == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("symbol", ["", " ", " BTC/USD", "BTC/USD ", "*", "BTC/USD,ETH/USD", "../BTC/USD", "BTC/USD/extra", "BTC//USD", "BTC\n/USD"])
-async def test_crypto_symbol_rejections_never_post(symbol):
-    tools, client = make_tools()
-    result = await tools["safe_place_crypto_order"](
-        symbol, "buy", notional="10", limit_price="10"
-    )
-    assert "error" in result and client.calls == []
-
-
-@pytest.mark.asyncio
-async def test_generated_client_order_id_and_invalid_env_fails_safe(monkeypatch):
-    monkeypatch.setenv("ALPACA_SAFE_MAX_ORDER_NOTIONAL", "abc")
-    tools, client = make_tools(FakeClient([(200, {"id": "ok"})]))
-    ok = await tools["safe_place_stock_order"]("AAPL", "buy", qty="1", limit_price="100")
-    assert client.calls[0][2]["json"]["client_order_id"].startswith("safe-")
-    assert ok["max_order_notional"] == "100"
-    rejected = await tools["safe_place_stock_order"]("AAPL", "buy", qty="1.01", limit_price="100")
-    assert "error" in rejected and len(client.calls) == 1
-
-
-@pytest.mark.asyncio
-async def test_order_boundaries_ids_and_unsupported_fields():
-    tools, client = make_tools(FakeClient([(200, {}), (200, {}), (200, {}), (200, {})]))
-    first = await tools["safe_place_stock_order"]("AAPL", "buy", qty="1", limit_price="100")
-    second = await tools["safe_place_stock_order"]("AAPL", "buy", notional="100", limit_price="1")
-    await tools["safe_place_crypto_order"]("BTC/USD", "buy", notional="10", limit_price="1")
-    await tools["safe_place_crypto_order"]("BTC/USD", "buy", notional="100", limit_price="1")
-    ids = [call[2]["json"]["client_order_id"] for call in client.calls]
-    assert len(set(ids)) == 4 and all(len(value) <= 128 for value in ids)
-    assert first["estimated_notional"] == second["estimated_notional"] == "100"
-    assert "order_class" not in tools["safe_place_stock_order"].__annotations__
-    assert "advanced_instructions" not in tools["safe_place_stock_order"].__annotations__
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("client_id", ["", "   ", "x" * 129, " leading", "trailing ", "bad\nline"])
-async def test_invalid_client_order_ids_never_post(client_id):
-    tools, client = make_tools()
-    result = await tools["safe_place_stock_order"](
-        "AAPL", "buy", qty="1", limit_price="10", client_order_id=client_id
-    )
-    assert "error" in result and client.calls == []
-
-
-@pytest.mark.asyncio
-async def test_caller_client_order_id_passed_exactly():
-    tools, client = make_tools(FakeClient([(200, {})]))
-    await tools["safe_place_stock_order"](
-        "AAPL", "buy", qty="1", limit_price="10", client_order_id="caller-id_1"
-    )
-    assert client.calls[0][2]["json"]["client_order_id"] == "caller-id_1"
-
-
-@pytest.mark.asyncio
-async def test_cancel_prechecks_then_cancels_exactly_one():
-    tools, client = make_tools(FakeClient([(200, {"id": ORDER_ID}), (204, {})]))
-    await tools["safe_cancel_order"](ORDER_ID)
-    path = f"/v2/orders/{ORDER_ID}"
-    assert [(m, p) for m, p, _ in client.calls] == [("GET", path), ("DELETE", path)]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("order_id", ["", " ", "*", "all", "a,b", "a/b", "%2F", ".."])
-async def test_cancel_identifier_attacks_make_no_request(order_id):
-    tools, client = make_tools()
-    assert "error" in await tools["safe_cancel_order"](order_id)
-    assert client.calls == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("status,payload", [(404, {}), (401, {}), (403, {}), (200, {}), (200, {"id": "different"})])
-async def test_cancel_failed_prechecks_never_delete(status, payload):
-    tools, client = make_tools(FakeClient([(status, payload)]))
-    assert "error" in await tools["safe_cancel_order"](ORDER_ID)
+@pytest.mark.parametrize("client_id", ["manual", "safe-legacy", "safe-v2-forged"])
+async def test_manual_legacy_and_forged_orders_cannot_cancel(client_id):
+    tools, client, _ = make_tools()
+    client.get_payload = {"id": ORDER_1, "client_order_id": client_id}
+    assert "error" in await tools["safe_cancel_order"](ORDER_1, "strategy-1")
     assert [c[0] for c in client.calls] == ["GET"]
 
 
 @pytest.mark.asyncio
-async def test_close_cap_and_single_endpoint():
-    tools, client = make_tools(FakeClient([(200, {"market_value": "25.01"})]))
-    assert "error" in await tools["safe_close_position"]("AAPL")
+async def test_missing_and_corrupt_ownership_cannot_cancel():
+    tools, client, store, row = await owned_order()
+    store.rows.clear()
+    assert "error" in await tools["safe_cancel_order"](ORDER_1, "strategy-1")
     assert [c[0] for c in client.calls] == ["GET"]
-    tools, client = make_tools(FakeClient([(200, {"market_value": "-25"}), (200, {"id": "close"})]))
-    await tools["safe_close_position"]("AAPL")
-    assert [(m, p) for m, p, _ in client.calls] == [("GET", "/v2/positions/AAPL"), ("DELETE", "/v2/positions/AAPL")]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("identifier", ["", " ", "*", "all", "ALL", "AAPL,MSFT", "../orders", "%2F"])
-async def test_close_identifier_attacks_make_no_request(identifier):
-    tools, client = make_tools()
-    assert "error" in await tools["safe_close_position"](identifier)
-    assert client.calls == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("value", [None, "bad", "NaN", "Infinity", "25.000001", "-25.000001"])
-async def test_close_invalid_or_over_cap_values_never_delete(value):
-    payload = {} if value is None else {"market_value": value}
-    tools, client = make_tools(FakeClient([(200, payload)]))
-    assert "error" in await tools["safe_close_position"]("AAPL")
+    store.rows[row.client_order_id] = replace(row, idempotency_key="corrupt")
+    client.calls.clear()
+    assert "error" in await tools["safe_cancel_order"](ORDER_1, "strategy-1")
     assert [c[0] for c in client.calls] == ["GET"]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("value", ["25", "-25"])
-async def test_close_absolute_boundary_is_allowed(value):
-    tools, client = make_tools(FakeClient([(200, {"market_value": value}), (200, {})]))
-    await tools["safe_close_position"]("BTC/USD")
-    path = "/v2/positions/BTC%2FUSD"
-    assert [(m, p) for m, p, _ in client.calls] == [("GET", path), ("DELETE", path)]
+async def test_unavailable_ownership_store_cannot_cancel():
+    tools, client, store, _ = await owned_order()
+    store.unavailable = True
+    assert "error" in await tools["safe_cancel_order"](ORDER_1, "strategy-1")
+    assert [c[0] for c in client.calls] == ["GET"]
 
 
 @pytest.mark.asyncio
-async def test_live_gate_rejects_all_writes(monkeypatch):
-    monkeypatch.setenv("ALPACA_PAPER_TRADE", "false")
-    tools, client = make_tools()
-    calls = [
-        tools["safe_place_stock_order"]("AAPL", "buy", qty="1", limit_price="10"),
-        tools["safe_place_crypto_order"]("BTC/USD", "buy", notional="10", limit_price="10"),
-        tools["safe_cancel_order"](ORDER_ID), tools["safe_close_position"]("AAPL"),
-    ]
-    results = [await call for call in calls]
-    assert all(r["error"]["message"] == "Safe Trading V1 write operations are Paper-only." for r in results)
-    assert client.calls == []
+async def test_cross_strategy_and_principal_cannot_cancel():
+    tools, client, store, row = await owned_order()
+    assert "error" in await tools["safe_cancel_order"](ORDER_1, "other")
+    other_tools, other_client, _ = make_tools(store=store, principal="principal-b")
+    other_client.get_payload = {"id": ORDER_1, "client_order_id": row.client_order_id}
+    assert "error" in await other_tools["safe_cancel_order"](ORDER_1, "strategy-1")
+    assert all(c[0] != "DELETE" for c in client.calls + other_client.calls)
 
 
 @pytest.mark.asyncio
-async def test_timeouts_never_retry_writes():
-    tools, client = make_tools(FakeClient(timeout_method="POST"))
-    result = await tools["safe_place_stock_order"]("AAPL", "buy", qty="1", limit_price="10", client_order_id="known")
-    assert result["uncertain"] and len(client.calls) == 1
-    tools, client = make_tools(FakeClient([(200, {"market_value": "10"})], timeout_method="DELETE"))
-    result = await tools["safe_close_position"]("AAPL")
+async def test_order_id_mismatch_cannot_cancel():
+    tools, client, store, row = await owned_order()
+    store.rows[row.client_order_id] = replace(row, order_id="223e4567-e89b-42d3-a456-426614174000")
+    assert "error" in await tools["safe_cancel_order"](ORDER_1, "strategy-1")
+    assert [c[0] for c in client.calls] == ["GET"]
+
+
+@pytest.mark.asyncio
+async def test_alpaca_response_id_mismatch_cannot_cancel():
+    tools, client, _, row = await owned_order()
+    client.get_payload = {
+        "id": "223e4567-e89b-42d3-a456-426614174000",
+        "client_order_id": row.client_order_id,
+    }
+    assert "error" in await tools["safe_cancel_order"](ORDER_1, "strategy-1")
+    assert [c[0] for c in client.calls] == ["GET"]
+
+
+@pytest.mark.asyncio
+async def test_valid_owned_cancel_deletes_once():
+    tools, client, store, row = await owned_order()
+    result = await tools["safe_cancel_order"](ORDER_1, "strategy-1")
+    assert "error" not in result and [c[0] for c in client.calls] == ["GET", "DELETE"]
+    assert store.rows[row.client_order_id].status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_delete_timeout_once_and_retains_uncertain():
+    tools, client, store, row = await owned_order()
+    client.delete_timeout = True
+    result = await tools["safe_cancel_order"](ORDER_1, "strategy-1")
     assert result["uncertain"] and [c[0] for c in client.calls] == ["GET", "DELETE"]
+    assert store.rows[row.client_order_id].status == "cancel_uncertain"
+    client.calls.clear()
+    client.delete_timeout = False
+    assert "error" in await tools["safe_cancel_order"](ORDER_1, "strategy-1")
+    assert [c[0] for c in client.calls] == ["GET"]
 
 
 @pytest.mark.asyncio
-async def test_cancel_delete_timeout_is_uncertain_and_not_retried():
-    tools, client = make_tools(FakeClient([(200, {"id": ORDER_ID})], timeout_method="DELETE"))
-    result = await tools["safe_cancel_order"](ORDER_ID)
-    assert result["uncertain"] and [c[0] for c in client.calls] == ["GET", "DELETE"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("tool_name,args", [
-    ("safe_cancel_order", (ORDER_ID,)), ("safe_close_position", ("AAPL",)),
-])
-async def test_get_timeout_never_reaches_delete(tool_name, args):
-    tools, client = make_tools(FakeClient(timeout_method="GET"))
-    result = await tools[tool_name](*args)
-    assert "error" in result and [c[0] for c in client.calls] == ["GET"]
-
-
-@pytest.mark.parametrize("raw,expected", [
-    (None, True), ("true", True), ("TRUE", True), ("1", True), ("yes", True), ("false", False),
-])
-def test_safe_mode_environment_matrix(monkeypatch, raw, expected):
-    if raw is None: monkeypatch.delenv("ALPACA_SAFE_MODE", raising=False)
-    else: monkeypatch.setenv("ALPACA_SAFE_MODE", raw)
-    assert _safe_mode_enabled() is expected
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("raw,allowed", [
-    (None, False), ("true", True), ("TRUE", True), ("1", True), ("yes", True),
-    ("false", False), ("0", False), ("no", False), ("unexpected", False),
-])
-async def test_paper_environment_matrix(monkeypatch, raw, allowed):
-    if raw is None: monkeypatch.delenv("ALPACA_PAPER_TRADE", raising=False)
-    else: monkeypatch.setenv("ALPACA_PAPER_TRADE", raw)
-    tools, client = make_tools(FakeClient([(200, {})]))
-    result = await tools["safe_place_stock_order"]("AAPL", "buy", qty="1", limit_price="10")
-    assert ("error" not in result) is allowed
-    assert len(client.calls) == (1 if allowed else 0)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("name,value", [
-    ("ALPACA_SAFE_MAX_ORDER_NOTIONAL", ""), ("ALPACA_SAFE_MAX_ORDER_NOTIONAL", "abc"),
-    ("ALPACA_SAFE_MAX_ORDER_NOTIONAL", "NaN"), ("ALPACA_SAFE_MAX_ORDER_NOTIONAL", "Infinity"),
-    ("ALPACA_SAFE_MAX_ORDER_NOTIONAL", "0"), ("ALPACA_SAFE_MAX_ORDER_NOTIONAL", "-1"),
-    ("ALPACA_SAFE_MAX_ORDER_NOTIONAL", "1e999999"),
-    ("ALPACA_SAFE_MAX_CLOSE_MARKET_VALUE", "1e999999"),
-    ("ALPACA_SAFE_MIN_CRYPTO_NOTIONAL", "0.00001"),
-])
-async def test_environment_limits_never_expand_permissions(monkeypatch, name, value):
-    monkeypatch.setenv(name, value)
-    tools, client = make_tools(FakeClient([(200, {"market_value": "25.01"})]))
-    if name == "ALPACA_SAFE_MAX_CLOSE_MARKET_VALUE":
-        result = await tools["safe_close_position"]("AAPL")
-    elif name == "ALPACA_SAFE_MIN_CRYPTO_NOTIONAL":
-        result = await tools["safe_place_crypto_order"]("BTC/USD", "buy", notional="9.99", limit_price="1")
+@pytest.mark.parametrize("paper", [None, "false", "0", "no", "unexpected"])
+async def test_paper_configuration_fails_closed(monkeypatch, paper):
+    if paper is None:
+        monkeypatch.delenv("ALPACA_PAPER_TRADE", raising=False)
     else:
-        result = await tools["safe_place_stock_order"]("AAPL", "buy", notional="100.01", limit_price="1")
-    assert "error" in result and all(call[0] != "POST" and call[0] != "DELETE" for call in client.calls)
+        monkeypatch.setenv("ALPACA_PAPER_TRADE", paper)
+    tools, client, _ = make_tools()
+    assert "error" in await place(tools)
+    assert "error" in await tools["safe_cancel_order"](ORDER_1, "strategy-1")
+    assert not client.calls
+
+
+@pytest.mark.parametrize(
+    "name,value,field,hard",
+    [
+        ("ALPACA_SAFE_MAX_OPEN_ORDERS", "999", "max_open_orders", 5),
+        ("ALPACA_SAFE_MAX_OPEN_NOTIONAL", "999999", "max_open_notional", Decimal(300)),
+        (
+            "ALPACA_SAFE_MAX_DAILY_SUBMITTED_NOTIONAL",
+            "Infinity",
+            "max_daily_submitted_notional",
+            Decimal(500),
+        ),
+        (
+            "ALPACA_SAFE_MAX_SYMBOL_OPEN_NOTIONAL",
+            "999999",
+            "max_symbol_open_notional",
+            Decimal(200),
+        ),
+    ],
+)
+def test_environment_cannot_expand_hard_limits(monkeypatch, name, value, field, hard):
+    monkeypatch.setenv(name, value)
+    assert getattr(_limits(), field) == hard
+
+
+@pytest.mark.asyncio
+async def test_hosted_mode_ignores_safe_mode_false(monkeypatch):
+    monkeypatch.setenv("ALPACA_SAFE_MODE", "false")
+    verifier = __import__(
+        "fastmcp.server.auth.providers.jwt", fromlist=["StaticTokenVerifier"]
+    ).StaticTokenVerifier({})
+    names = {
+        tool.name
+        for tool in await build_server(
+            hosted_mode=True,
+            auth_provider=verifier,
+            principal_provider=lambda: "principal-a",
+        ).list_tools()
+    }
+    assert "safe_place_stock_order" in names and "place_stock_order" not in names
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "broker_status,target",
+    [
+        ("new", "submitted"),
+        ("filled", "filled"),
+        ("expired", "expired"),
+        ("canceled", "cancelled"),
+        ("rejected", "rejected"),
+    ],
+)
+async def test_verified_reconciliation_state_machine(broker_status, target):
+    tools, client, store = make_tools()
+    await place(tools)
+    operation = next(iter(store.rows.values()))
+    client.calls.clear()
+    client.get_payload = {
+        "id": ORDER_1,
+        "client_order_id": operation.client_order_id,
+        "symbol": operation.symbol,
+        "status": broker_status,
+    }
+    summary = await reconcile_pending(
+        client,
+        store,
+        ownership_proof=lambda row: _proof(row, "test-secret-not-production"),
+        principal="principal-a",
+    )
+    updated = store.rows[operation.client_order_id]
+    assert summary == {"checked": 1, "updated": 1, "quarantined": 0}
+    assert updated.status == target and updated.broker_status == broker_status
+    assert updated.reserved_notional == (Decimal(50) if target == "submitted" else Decimal(0))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload,status",
+    [
+        ({}, 200),
+        ({"id": ORDER_1, "client_order_id": "forged", "symbol": "AAPL", "status": "filled"}, 200),
+        ({"id": ORDER_1, "client_order_id": "unused", "symbol": "MSFT", "status": "filled"}, 200),
+        ({"id": ORDER_1, "client_order_id": "unused", "symbol": "AAPL", "status": "unknown"}, 200),
+        ({}, 404),
+        ({}, 503),
+    ],
+)
+async def test_ambiguous_reconciliation_never_releases_risk(payload, status):
+    tools, client, store = make_tools()
+    await place(tools)
+    operation = next(iter(store.rows.values()))
+    if payload.get("client_order_id") == "unused":
+        payload["client_order_id"] = operation.client_order_id
+    client.calls.clear()
+    client.get_payload = payload
+    client.get_status = status
+    summary = await reconcile_pending(
+        client,
+        store,
+        ownership_proof=lambda row: _proof(row, "test-secret-not-production"),
+        principal="principal-a",
+    )
+    assert summary["updated"] == 0 and summary["quarantined"] == 1
+    assert store.rows[operation.client_order_id].reserved_notional == Decimal(50)
+
+
+@pytest.mark.asyncio
+async def test_forged_hmac_and_cross_principal_reconciliation_are_quarantined():
+    tools, client, store = make_tools()
+    await place(tools)
+    key = next(iter(store.rows))
+    store.rows[key] = replace(store.rows[key], idempotency_key="forged")
+    operation = store.rows[key]
+    client.get_payload = {
+        "id": ORDER_1,
+        "client_order_id": key,
+        "symbol": operation.symbol,
+        "status": "filled",
+    }
+    forged = await reconcile_pending(
+        client,
+        store,
+        ownership_proof=lambda row: _proof(row, "test-secret-not-production"),
+        principal="principal-a",
+    )
+    cross = await reconcile_pending(
+        client,
+        store,
+        ownership_proof=lambda row: True,
+        principal="principal-b",
+    )
+    assert forged["updated"] == cross["updated"] == 0
+    assert store.rows[key].reserved_notional == Decimal(50)
+
+
+@pytest.mark.asyncio
+async def test_terminal_state_replay_never_posts_again():
+    tools, client, store = make_tools()
+    await place(tools)
+    key = next(iter(store.rows))
+    store.rows[key] = replace(
+        store.rows[key], status="filled", reserved_notional=Decimal(0), broker_status="filled"
+    )
+    client.calls.clear()
+    replay = await place(tools)
+    assert replay["idempotent_replay"] and replay["status"] == "filled"
+    assert not client.calls
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_rejects_mismatched_stored_order_id():
+    tools, client, store = make_tools()
+    await place(tools)
+    key = next(iter(store.rows))
+    store.rows[key] = replace(store.rows[key], order_id=ORDER_1, status="submitted")
+    client.calls.clear()
+    client.get_payload = {
+        "id": "223e4567-e89b-42d3-a456-426614174000",
+        "client_order_id": key,
+        "symbol": "AAPL",
+        "status": "filled",
+    }
+    summary = await reconcile_pending(
+        client,
+        store,
+        ownership_proof=lambda row: _proof(row, "test-secret-not-production"),
+        principal="principal-a",
+    )
+    assert summary["updated"] == 0
+    assert store.rows[key].status == "submitted" and store.rows[key].reserved_notional == 50
+
+
+@pytest.mark.asyncio
+async def test_concurrent_reconciliation_and_reservation_never_exceeds_limit():
+    tools, client, store = make_tools()
+    for index in range(5):
+        await place(tools, key=f"existing-{index}", symbol=f"S{index}", notional="10")
+    operation = next(iter(store.rows.values()))
+    client.calls.clear()
+    client.get_payload = {
+        "id": ORDER_1,
+        "client_order_id": operation.client_order_id,
+        "symbol": operation.symbol,
+        "status": "filled",
+    }
+    await asyncio.gather(
+        reconcile_pending(
+            client,
+            store,
+            ownership_proof=lambda row: _proof(row, "test-secret-not-production"),
+            principal="principal-a",
+        ),
+        place(tools, key="concurrent-new", symbol="NEW", notional="10"),
+    )
+    assert sum(row.status in ACTIVE_STATUSES for row in store.rows.values()) <= 5
+    assert [call[0] for call in client.calls].count("POST") <= 1
+
+
+@pytest.mark.asyncio
+async def test_active_cancel_uncertain_reconciliation_never_enables_second_delete():
+    tools, client, store, row = await owned_order()
+    store.rows[row.client_order_id] = replace(row, status="cancel_uncertain", uncertain=True)
+    client.get_payload = {
+        "id": ORDER_1,
+        "client_order_id": row.client_order_id,
+        "symbol": row.symbol,
+        "status": "pending_cancel",
+    }
+    summary = await reconcile_pending(
+        client,
+        store,
+        ownership_proof=lambda value: _proof(value, "test-secret-not-production"),
+        principal="principal-a",
+    )
+    assert summary["updated"] == 0 and summary["quarantined"] == 1
+    client.calls.clear()
+    result = await tools["safe_cancel_order"](ORDER_1, "strategy-1")
+    assert "error" in result and [call[0] for call in client.calls] == ["GET"]

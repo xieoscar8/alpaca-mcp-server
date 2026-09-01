@@ -30,7 +30,9 @@ classifiers = [
 ]
 
 dependencies = [
+    "asyncpg>=0.29.0,<1.0",
     "fastmcp>=3.1.0",
+    "py-key-value-aio[postgresql]>=0.4.5,<1.0",
     "httpx>=0.27.0",
     "python-dotenv>=1.0.0",
     "click>=8.1.0",
@@ -78,4 +80,5 @@ addopts = ["-v", "--tb=short"]
 asyncio_mode = "auto"
 markers = [
     "integration: requires paper API credentials (ALPACA_API_KEY, ALPACA_SECRET_KEY)",
+    "postgres: requires TEST_POSTGRES_DSN pointing to a disposable PostgreSQL database",
 ]

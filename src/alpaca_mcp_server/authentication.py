@@ -22,6 +22,19 @@ class PrincipalError(RuntimeError):
 PrincipalProvider = Callable[[], str]
 
 
+def validate_secret(value: str, name: str) -> str:
+    """Reject empty, short, whitespace-padded, or trivial hosted secrets."""
+    if (
+        not value
+        or value != value.strip()
+        or len(value) < 32
+        or len(set(value)) < 8
+        or value.lower() in {"change-me", "changeme", "test-secret", "secret"}
+    ):
+        raise AuthenticationConfigurationError(f"{name} is not securely configured")
+    return value
+
+
 def _required(name: str) -> str:
     value = os.environ.get(name, "")
     if not value or value != value.strip():
@@ -47,7 +60,9 @@ def build_managed_oidc_provider() -> AuthProvider:
             required_scopes=scopes,
             redirect_path="/auth/callback",
             client_storage=client_storage,
-            jwt_signing_key=_required("ALPACA_MCP_JWT_SIGNING_KEY"),
+            jwt_signing_key=validate_secret(
+                _required("ALPACA_MCP_JWT_SIGNING_KEY"), "Hosted JWT signing key"
+            ),
             require_authorization_consent=True,
         )
     except AuthenticationConfigurationError:
@@ -71,7 +86,10 @@ def authenticated_principal() -> str:
         or not isinstance(subject, str)
         or not subject
         or subject != subject.strip()
-        or (claim_subject is not None and claim_subject != subject)
+        or not isinstance(claim_subject, str)
+        or not claim_subject
+        or claim_subject != claim_subject.strip()
+        or claim_subject != subject
     ):
         raise PrincipalError("Authenticated issuer and subject are required")
     identity = f"{issuer}\0{subject}".encode()

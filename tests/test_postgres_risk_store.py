@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import asyncpg
@@ -14,6 +15,7 @@ from alpaca_mcp_server.risk_store import (
     RiskLimits,
     RiskStoreError,
 )
+from alpaca_mcp_server.safe_overrides import _canonical_symbol
 
 DSN = os.environ.get("TEST_POSTGRES_DSN", "")
 pytestmark = [
@@ -45,6 +47,7 @@ async def reserve(store, n, amount="10", symbol=None, limits=LIMITS, client_id=N
         client_order_id=client_id or f"safe-v2-{n:064x}",
         symbol=symbol or f"SYM{n}",
         asset_type="stock",
+        request_fingerprint=f"fingerprint-{n}",
         requested_notional=Decimal(amount),
         limits=limits,
     )
@@ -90,6 +93,7 @@ async def test_03_unique_principal_strategy_idempotency(store):
             client_order_id=first.operation.client_order_id,
             symbol="CHANGED",
             asset_type="stock",
+            request_fingerprint="changed-fingerprint",
             requested_notional=Decimal(10),
             limits=LIMITS,
         )
@@ -246,8 +250,9 @@ async def test_15_decimal_numeric_round_trip_is_exact(store):
 async def test_16_verified_terminal_reconciliation_releases_only_open_risk(store):
     created = await reserve(store, 1, "75")
     await store.mark_uncertain(created.operation.client_order_id)
+    uncertain = await store.get_by_client_order_id(created.operation.client_order_id)
     terminal = await store.reconcile_verified(
-        created.operation,
+        uncertain,
         order_id=ORDER,
         broker_status="filled",
         target_status="filled",
@@ -260,3 +265,134 @@ async def test_16_verified_terminal_reconciliation_releases_only_open_risk(store
     )
     await connection.close()
     assert daily == Decimal(75)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("variants", [("AAPL", "aapl", "AaPl"), ("BTC/USD", "btc/usd", "BtC/uSd")])
+async def test_17_concurrent_case_variants_share_symbol_limit(store, variants):
+    limits = RiskLimits(50, Decimal(5000), Decimal(5000), Decimal(200))
+    results = await asyncio.gather(
+        *(
+            reserve(store, index, "100", _canonical_symbol(symbol), limits)
+            for index, symbol in enumerate(variants)
+        ),
+        return_exceptions=True,
+    )
+    assert sum(not isinstance(result, Exception) for result in results) == 2
+    assert isinstance(results[2], RiskLimitExceeded)
+
+
+@pytest.mark.asyncio
+async def test_18_stale_reconciliation_cannot_reopen_cancel_uncertain(store):
+    created = await reserve(store, 1)
+    submitted = await store.mark_submitted(created.operation.client_order_id, ORDER)
+    await store.mark_cancel_uncertain(created.operation.client_order_id)
+    with pytest.raises(RiskStoreError):
+        await store.reconcile_verified(
+            submitted,
+            order_id=ORDER,
+            broker_status="new",
+            target_status="submitted",
+        )
+    current = await store.get_by_client_order_id(created.operation.client_order_id)
+    assert current.status == "cancel_uncertain" and current.uncertain
+
+
+@pytest.mark.asyncio
+async def test_19_fingerprint_replay_and_mismatch(store):
+    created = await reserve(store, 1)
+    replay = await reserve(store, 1)
+    assert created.created and not replay.created
+    with pytest.raises(RiskStoreError):
+        await store.reserve(
+            principal="principal-a",
+            strategy_id="strategy-a",
+            idempotency_key="key-1",
+            client_order_id=created.operation.client_order_id,
+            symbol="SYM1",
+            asset_type="stock",
+            request_fingerprint="different-intent",
+            requested_notional=Decimal(10),
+            limits=LIMITS,
+        )
+
+
+@pytest.mark.asyncio
+async def test_20_daily_limit_resets_only_at_utc_midnight(store):
+    limits = RiskLimits(50, Decimal(5000), Decimal(100), Decimal(5000))
+    before = datetime(2030, 1, 1, 23, 59, 59, tzinfo=timezone.utc)
+    midnight = datetime(2030, 1, 2, 0, 0, 0, tzinfo=timezone.utc)
+    created = await store.reserve(
+        principal="principal-a",
+        strategy_id="strategy-a",
+        idempotency_key="before",
+        client_order_id="safe-v2-" + "a" * 64,
+        symbol="AAPL",
+        asset_type="stock",
+        request_fingerprint="before-fingerprint",
+        requested_notional=Decimal(100),
+        limits=limits,
+        now_utc=before,
+    )
+    await store.mark_submitted(created.operation.client_order_id, ORDER, submitted_at=before)
+    await store.mark_cancelled(created.operation.client_order_id)
+    with pytest.raises(RiskLimitExceeded):
+        await store.reserve(
+            principal="principal-a",
+            strategy_id="strategy-a",
+            idempotency_key="same-day",
+            client_order_id="safe-v2-" + "b" * 64,
+            symbol="MSFT",
+            asset_type="stock",
+            request_fingerprint="same-day-fingerprint",
+            requested_notional=Decimal(1),
+            limits=limits,
+            now_utc=before,
+        )
+    after = await store.reserve(
+        principal="principal-a",
+        strategy_id="strategy-a",
+        idempotency_key="midnight",
+        client_order_id="safe-v2-" + "c" * 64,
+        symbol="MSFT",
+        asset_type="stock",
+        request_fingerprint="midnight-fingerprint",
+        requested_notional=Decimal(1),
+        limits=limits,
+        now_utc=midnight,
+    )
+    assert after.created
+
+
+@pytest.mark.asyncio
+async def test_21_schema_reinitialization_preserves_new_security_fields(store):
+    created = await reserve(store, 1)
+    await store.close()
+    restarted = PostgresRiskStore(DSN)
+    await restarted.open()
+    row = await restarted.get_by_client_order_id(created.operation.client_order_id)
+    assert row.request_fingerprint == "fingerprint-1" and row.state_version == 0
+    await restarted.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_status", ["filled", "expired", "cancelled", "rejected"])
+async def test_22_stale_reconciliation_cannot_reopen_terminal_state(store, terminal_status):
+    created = await reserve(store, 1)
+    await store.mark_uncertain(created.operation.client_order_id)
+    uncertain = await store.get_by_client_order_id(created.operation.client_order_id)
+    await store.reconcile_verified(
+        uncertain,
+        order_id=ORDER,
+        broker_status=terminal_status,
+        target_status=terminal_status,
+    )
+    with pytest.raises(RiskStoreError):
+        await store.reconcile_verified(
+            uncertain,
+            order_id=ORDER,
+            broker_status="new",
+            target_status="submitted",
+        )
+    current = await store.get_by_client_order_id(created.operation.client_order_id)
+    assert current.status == terminal_status and current.reserved_notional == 0

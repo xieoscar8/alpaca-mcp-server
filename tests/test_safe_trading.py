@@ -19,7 +19,8 @@ from alpaca_mcp_server.risk_store import (
     RiskStoreError,
 )
 from alpaca_mcp_server.safe_overrides import _limits, _proof, register_safe_trading_tools
-from alpaca_mcp_server.server import build_server
+from alpaca_mcp_server.server import _load_spec, build_server
+from alpaca_mcp_server.tool_registry import TOOL_NAMES
 
 ORDER_1 = "123e4567-e89b-42d3-a456-426614174000"
 
@@ -28,7 +29,9 @@ ORDER_1 = "123e4567-e89b-42d3-a456-426614174000"
 def safe_env(monkeypatch):
     monkeypatch.setenv("ALPACA_PAPER_TRADE", "true")
     monkeypatch.setenv("ALPACA_SAFE_PRINCIPAL", "principal-a")
-    monkeypatch.setenv("ALPACA_SAFE_OWNERSHIP_SECRET", "test-secret-not-production")
+    monkeypatch.setenv(
+        "ALPACA_SAFE_OWNERSHIP_SECRET", "test-ownership-secret-not-production-123456"
+    )
 
 
 class CaptureServer:
@@ -48,6 +51,7 @@ class FakeClient:
         self.calls = []
         self.post_timeout = False
         self.delete_timeout = False
+        self.delete_error = None
         self.get_timeout = False
         self.post_status = 200
         self.delete_status = 204
@@ -72,6 +76,8 @@ class FakeClient:
         self.calls.append(("DELETE", path, kwargs))
         if self.delete_timeout:
             raise httpx.ReadTimeout("timeout")
+        if self.delete_error is not None:
+            raise self.delete_error("ambiguous delete")
         return httpx.Response(self.delete_status, content=b"")
 
 
@@ -100,6 +106,7 @@ class FakeStore:
                     if (
                         row.client_order_id != kwargs["client_order_id"]
                         or row.symbol != kwargs["symbol"]
+                        or row.request_fingerprint != kwargs["request_fingerprint"]
                         or row.requested_notional != kwargs["requested_notional"]
                     ):
                         raise RiskStoreError("idempotency mismatch")
@@ -133,10 +140,12 @@ class FakeStore:
                 None,
                 kwargs["symbol"],
                 kwargs["asset_type"],
+                kwargs["request_fingerprint"],
                 amount,
                 amount,
                 "reserved",
                 False,
+                0,
             )
             self.rows[row.client_order_id] = row
             return Reservation(row, True)
@@ -147,11 +156,11 @@ class FakeStore:
         row = self.rows.get(key)
         if row is None:
             raise RiskStoreError("missing")
-        row = replace(row, **changes)
+        row = replace(row, state_version=row.state_version + 1, **changes)
         self.rows[key] = row
         return row
 
-    async def mark_submitted(self, key, order_id):
+    async def mark_submitted(self, key, order_id, submitted_at=None):
         return await self._set(key, order_id=order_id, status="submitted")
 
     async def mark_uncertain(self, key):
@@ -185,7 +194,8 @@ class FakeStore:
             current = self.rows.get(operation.client_order_id)
             if (
                 current is None
-                or current.status not in ACTIVE_STATUSES
+                or current.status != operation.status
+                or current.state_version != operation.state_version
                 or current.principal != operation.principal
                 or current.strategy_id != operation.strategy_id
                 or current.symbol != operation.symbol
@@ -204,6 +214,18 @@ class FakeStore:
 
     async def mark_cancelled(self, key):
         await self._set(key, status="cancelled", reserved_notional=Decimal(0))
+
+    async def begin_cancel(self, key):
+        row = self.rows.get(key)
+        if row is None or row.status != "submitted":
+            raise RiskStoreError("not cancellable")
+        return await self._set(key, status="cancel_uncertain", uncertain=True)
+
+    async def mark_cancel_rejected(self, key):
+        row = self.rows.get(key)
+        if row is None or row.status != "cancel_uncertain":
+            raise RiskStoreError("not cancellation uncertain")
+        return await self._set(key, status="submitted", uncertain=False)
 
     async def mark_cancel_uncertain(self, key):
         await self._set(key, status="cancel_uncertain", uncertain=True)
@@ -236,7 +258,27 @@ async def place(tools, *, key="key-1", strategy="strategy-1", symbol="AAPL", not
 async def test_only_three_v2_writes_are_exposed(monkeypatch):
     monkeypatch.delenv("ALPACA_SAFE_MODE", raising=False)
     names = {tool.name for tool in await build_server().list_tools()}
-    assert {"safe_place_stock_order", "safe_place_crypto_order", "safe_cancel_order"} <= names
+    expected = {"safe_place_stock_order", "safe_place_crypto_order", "safe_cancel_order"}
+    write_names = {
+        TOOL_NAMES.get(operation["operationId"], operation["operationId"])
+        for path_item in _load_spec("trading-api")["paths"].values()
+        for method, operation in path_item.items()
+        if method.lower() in {"post", "put", "patch", "delete"}
+        and isinstance(operation, dict)
+        and "operationId" in operation
+    }
+    write_names.update(
+        {
+            "place_stock_order",
+            "place_crypto_order",
+            "place_option_order",
+            "safe_place_stock_order",
+            "safe_place_crypto_order",
+            "safe_cancel_order",
+            "safe_close_position",
+        }
+    )
+    assert names & write_names == expected
     assert "safe_close_position" not in names
     assert not (
         {
@@ -332,6 +374,19 @@ async def test_symbol_open_notional_limit():
     await place(tools, key="b", notional="100")
     assert "error" in await place(tools, key="c", notional="1")
     assert [c[0] for c in client.calls].count("POST") == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("symbols", [("AAPL", "aapl", "AaPl"), ("BTC/USD", "btc/usd", "BtC/uSd")])
+async def test_case_variants_share_one_symbol_bucket(symbols):
+    tools, client, _ = make_tools()
+    tool = tools["safe_place_stock_order"] if "/" not in symbols[0] else tools["safe_place_crypto_order"]
+    await tool(symbols[0], "buy", "s", "a", notional="100", limit_price="10")
+    await tool(symbols[1], "buy", "s", "b", notional="100", limit_price="10")
+    rejected = await tool(symbols[2], "buy", "s", "c", notional="10", limit_price="10")
+    assert "error" in rejected
+    assert [call[0] for call in client.calls].count("POST") == 2
+    assert all(call[2]["json"]["symbol"] == symbols[0].upper() for call in client.calls)
 
 
 @pytest.mark.asyncio
@@ -491,6 +546,28 @@ async def test_valid_owned_cancel_deletes_once():
 
 
 @pytest.mark.asyncio
+async def test_concurrent_owned_cancels_issue_one_delete():
+    tools, client, store, row = await owned_order()
+    results = await asyncio.gather(
+        tools["safe_cancel_order"](ORDER_1, "strategy-1"),
+        tools["safe_cancel_order"](ORDER_1, "strategy-1"),
+    )
+    assert sum("error" not in result for result in results) == 1
+    assert [call[0] for call in client.calls].count("DELETE") == 1
+    assert store.rows[row.client_order_id].status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_definitive_cancel_rejection_restores_submitted_state():
+    tools, client, store, row = await owned_order()
+    client.delete_status = 422
+    result = await tools["safe_cancel_order"](ORDER_1, "strategy-1")
+    assert result["http_status"] == 422
+    assert store.rows[row.client_order_id].status == "submitted"
+    assert [call[0] for call in client.calls].count("DELETE") == 1
+
+
+@pytest.mark.asyncio
 async def test_delete_timeout_once_and_retains_uncertain():
     tools, client, store, row = await owned_order()
     client.delete_timeout = True
@@ -501,6 +578,55 @@ async def test_delete_timeout_once_and_retains_uncertain():
     client.delete_timeout = False
     assert "error" in await tools["safe_cancel_order"](ORDER_1, "strategy-1")
     assert [c[0] for c in client.calls] == ["GET"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_type", [httpx.ReadTimeout, httpx.ConnectError, httpx.WriteError, httpx.ProtocolError]
+)
+async def test_ambiguous_delete_errors_are_never_replayed(error_type):
+    tools, client, store, row = await owned_order()
+    client.delete_error = error_type
+    first = await tools["safe_cancel_order"](ORDER_1, "strategy-1")
+    client.delete_error = None
+    second = await tools["safe_cancel_order"](ORDER_1, "strategy-1")
+    assert first["uncertain"] and "error" in second
+    assert [call[0] for call in client.calls].count("DELETE") == 1
+    assert store.rows[row.client_order_id].status == "cancel_uncertain"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [408, 500, 502, 503, 504])
+async def test_ambiguous_delete_statuses_are_never_replayed(status):
+    tools, client, store, row = await owned_order()
+    client.delete_status = status
+    first = await tools["safe_cancel_order"](ORDER_1, "strategy-1")
+    client.delete_status = 204
+    second = await tools["safe_cancel_order"](ORDER_1, "strategy-1")
+    assert first["uncertain"] and first["http_status"] == status and "error" in second
+    assert [call[0] for call in client.calls].count("DELETE") == 1
+    assert store.rows[row.client_order_id].status == "cancel_uncertain"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "first,second",
+    [
+        ({"qty": "5", "limit_price": "10"}, {"qty": "10", "limit_price": "5"}),
+        ({"notional": "50", "limit_price": "10"}, {"notional": "50", "limit_price": "5"}),
+        (
+            {"notional": "50", "limit_price": "10", "time_in_force": "day"},
+            {"notional": "50", "limit_price": "10", "time_in_force": "gtc"},
+        ),
+        ({"qty": "5", "limit_price": "10"}, {"notional": "50", "limit_price": "10"}),
+    ],
+)
+async def test_changed_order_intent_replay_is_rejected(first, second):
+    tools, client, _ = make_tools()
+    await tools["safe_place_stock_order"]("AAPL", "buy", "s", "same-key", **first)
+    result = await tools["safe_place_stock_order"]("aapl", "buy", "s", "same-key", **second)
+    assert "error" in result
+    assert [call[0] for call in client.calls].count("POST") == 1
 
 
 @pytest.mark.asyncio
@@ -543,6 +669,7 @@ def test_environment_cannot_expand_hard_limits(monkeypatch, name, value, field, 
 @pytest.mark.asyncio
 async def test_hosted_mode_ignores_safe_mode_false(monkeypatch):
     monkeypatch.setenv("ALPACA_SAFE_MODE", "false")
+    monkeypatch.setenv("ALPACA_MCP_JWT_SIGNING_KEY", "independent-jwt-secret-not-production-1234")
     verifier = __import__(
         "fastmcp.server.auth.providers.jwt", fromlist=["StaticTokenVerifier"]
     ).StaticTokenVerifier({})

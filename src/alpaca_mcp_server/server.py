@@ -7,6 +7,7 @@ No hand-crafted tool functions except for overrides (e.g., order placement).
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 from collections.abc import AsyncIterator
@@ -21,10 +22,12 @@ from fastmcp.server.auth import AuthProvider
 from fastmcp.server.providers.openapi.routing import MCPType
 
 from .authentication import (
+    AuthenticationConfigurationError,
     PrincipalProvider,
     authenticated_principal,
     build_managed_oidc_provider,
     local_principal_provider,
+    validate_secret,
 )
 from .readme_docs import ReadMeClientFactory, register_readme_docs_tools
 from .risk_store import PostgresRiskStore, RiskStore, UnavailableRiskStore
@@ -175,9 +178,16 @@ def build_server(
     active_toolsets = _parse_toolsets()
     spec_ops = get_active_operations(active_toolsets)
     safe_mode = _safe_mode_enabled(hosted_mode=hosted_mode)
+    ownership_secret: str | None = None
     if hosted_mode:
         auth_provider = auth_provider or build_managed_oidc_provider()
         principal_provider = principal_provider or authenticated_principal
+        ownership_secret = validate_secret(
+            os.environ.get("ALPACA_SAFE_OWNERSHIP_SECRET", ""), "Safe ownership secret"
+        )
+        jwt_secret = os.environ.get("ALPACA_MCP_JWT_SIGNING_KEY", "")
+        if jwt_secret and hmac.compare_digest(ownership_secret, jwt_secret):
+            raise AuthenticationConfigurationError("Hosted secrets must be independently configured")
     else:
         principal_provider = principal_provider or local_principal_provider(
             os.environ.get("ALPACA_SAFE_PRINCIPAL", "")
@@ -260,7 +270,9 @@ def build_server(
 
     if trading_client is not None and "trading" in active_ts:
         if safe_mode:
-            _register_safe_trading_overrides(main, trading_client, risk_store, principal_provider)
+            _register_safe_trading_overrides(
+                main, trading_client, risk_store, principal_provider, ownership_secret
+            )
         else:
             _register_trading_overrides(main, trading_client)
 
@@ -284,6 +296,7 @@ def _register_safe_trading_overrides(
     trading_client: httpx.AsyncClient,
     risk_store: RiskStore,
     principal_provider: PrincipalProvider,
+    ownership_secret: str | None = None,
 ) -> None:
     """Register the only write tools permitted by Safe Trading V2."""
     from .safe_overrides import register_safe_trading_tools
@@ -293,7 +306,11 @@ def _register_safe_trading_overrides(
         trading_client,
         risk_store,
         principal_provider=principal_provider,
-        ownership_secret=os.environ.get("ALPACA_SAFE_OWNERSHIP_SECRET", ""),
+        ownership_secret=(
+            ownership_secret
+            if ownership_secret is not None
+            else os.environ.get("ALPACA_SAFE_OWNERSHIP_SECRET", "")
+        ),
     )
 
 

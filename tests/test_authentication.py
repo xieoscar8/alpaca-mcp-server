@@ -40,6 +40,7 @@ def test_principal_is_stable_and_binds_issuer_and_subject(monkeypatch):
         token(subject=""),
         token(issuer=None),
         token(claim_subject="other"),
+        token(claim_subject=None),
     ],
 )
 def test_missing_or_inconsistent_authenticated_identity_fails(monkeypatch, value):
@@ -63,6 +64,22 @@ def test_hosted_oidc_configuration_missing_fails_closed(monkeypatch):
         build_server(hosted_mode=True)
 
 
+@pytest.mark.parametrize("secret", ["", "short", "a" * 64])
+def test_hosted_ownership_secret_must_be_strong(monkeypatch, secret):
+    verifier = StaticTokenVerifier({})
+    monkeypatch.setenv("ALPACA_SAFE_OWNERSHIP_SECRET", secret)
+    with pytest.raises(AuthenticationConfigurationError):
+        build_server(hosted_mode=True, auth_provider=verifier)
+
+
+def test_hosted_secrets_must_be_independent(monkeypatch):
+    shared = "shared-secret-with-enough-variety-123456789"
+    monkeypatch.setenv("ALPACA_SAFE_OWNERSHIP_SECRET", shared)
+    monkeypatch.setenv("ALPACA_MCP_JWT_SIGNING_KEY", shared)
+    with pytest.raises(AuthenticationConfigurationError):
+        build_server(hosted_mode=True, auth_provider=StaticTokenVerifier({}))
+
+
 def test_managed_oidc_provider_uses_locked_fastmcp_architecture(monkeypatch):
     values = {
         "ALPACA_MCP_OAUTH_SCOPES": "alpaca:read alpaca:safe-write",
@@ -70,7 +87,7 @@ def test_managed_oidc_provider_uses_locked_fastmcp_architecture(monkeypatch):
         "ALPACA_MCP_OIDC_CLIENT_ID": "client",
         "ALPACA_MCP_OIDC_CLIENT_SECRET": "secret",
         "ALPACA_MCP_PUBLIC_BASE_URL": "https://mcp.example",
-        "ALPACA_MCP_JWT_SIGNING_KEY": "test-signing-key",
+        "ALPACA_MCP_JWT_SIGNING_KEY": "test-signing-key-with-32-plus-characters-123",
         "DATABASE_URL": "postgresql://test:test@localhost/test",
     }
     for name, value in values.items():
@@ -84,7 +101,7 @@ def test_managed_oidc_provider_uses_locked_fastmcp_architecture(monkeypatch):
     assert kwargs["required_scopes"] == ["alpaca:read", "alpaca:safe-write"]
     assert kwargs["redirect_path"] == "/auth/callback"
     assert kwargs["client_storage"] is storage.return_value
-    assert kwargs["jwt_signing_key"] == "test-signing-key"
+    assert kwargs["jwt_signing_key"] == "test-signing-key-with-32-plus-characters-123"
     assert kwargs["require_authorization_consent"] is True
 
 
@@ -92,6 +109,10 @@ def test_remote_endpoint_protects_initialize_list_and_call(monkeypatch):
     monkeypatch.setenv("ALPACA_API_KEY", "test-key")
     monkeypatch.setenv("ALPACA_SECRET_KEY", "test-secret")
     monkeypatch.setenv("ALPACA_TOOLSETS", "")
+    monkeypatch.setenv(
+        "ALPACA_SAFE_OWNERSHIP_SECRET", "independent-ownership-secret-not-production-1234"
+    )
+    monkeypatch.setenv("ALPACA_MCP_JWT_SIGNING_KEY", "independent-jwt-secret-not-production-1234")
     verifier = StaticTokenVerifier(
         {
             "valid": {

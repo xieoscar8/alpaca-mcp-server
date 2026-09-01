@@ -27,10 +27,12 @@ class Operation:
     order_id: str | None
     symbol: str
     asset_type: str
+    request_fingerprint: str
     requested_notional: Decimal
     reserved_notional: Decimal
     status: str
     uncertain: bool
+    state_version: int
     broker_status: str | None = None
     reconciled_at: datetime | None = None
 
@@ -61,10 +63,14 @@ class RiskStore(Protocol):
         client_order_id: str,
         symbol: str,
         asset_type: str,
+        request_fingerprint: str,
         requested_notional: Decimal,
         limits: RiskLimits,
+        now_utc: datetime | None = None,
     ) -> Reservation: ...
-    async def mark_submitted(self, client_order_id: str, order_id: str) -> Operation: ...
+    async def mark_submitted(
+        self, client_order_id: str, order_id: str, submitted_at: datetime | None = None
+    ) -> Operation: ...
     async def mark_uncertain(self, client_order_id: str) -> None: ...
     async def mark_rejected(self, client_order_id: str) -> None: ...
     async def get_by_client_order_id(self, client_order_id: str) -> Operation | None: ...
@@ -79,6 +85,8 @@ class RiskStore(Protocol):
         target_status: str,
     ) -> Operation: ...
     async def mark_cancelled(self, client_order_id: str) -> None: ...
+    async def begin_cancel(self, client_order_id: str) -> Operation: ...
+    async def mark_cancel_rejected(self, client_order_id: str) -> Operation: ...
     async def mark_cancel_uncertain(self, client_order_id: str) -> None: ...
 
 
@@ -121,6 +129,12 @@ class UnavailableRiskStore:
     async def mark_cancelled(self, *_args) -> None:
         self._fail()
 
+    async def begin_cancel(self, *_args) -> Operation:
+        self._fail()
+
+    async def mark_cancel_rejected(self, *_args) -> Operation:
+        self._fail()
+
     async def mark_cancel_uncertain(self, *_args) -> None:
         self._fail()
 
@@ -135,6 +149,7 @@ CREATE TABLE IF NOT EXISTS safe_v2_operations (
     alpaca_order_id UUID,
     symbol TEXT NOT NULL,
     asset_type TEXT NOT NULL CHECK (asset_type IN ('stock', 'crypto')),
+    request_fingerprint TEXT NOT NULL,
     requested_notional NUMERIC NOT NULL CHECK (requested_notional > 0),
     reserved_notional NUMERIC NOT NULL CHECK (reserved_notional >= 0),
     status TEXT NOT NULL CHECK (
@@ -142,6 +157,7 @@ CREATE TABLE IF NOT EXISTS safe_v2_operations (
                    'cancelled', 'cancel_uncertain', 'filled', 'expired')
     ),
     uncertain BOOLEAN NOT NULL DEFAULT FALSE,
+    state_version BIGINT NOT NULL DEFAULT 0,
     submitted_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -149,7 +165,14 @@ CREATE TABLE IF NOT EXISTS safe_v2_operations (
 );
 ALTER TABLE safe_v2_operations
     ADD COLUMN IF NOT EXISTS broker_status TEXT,
-    ADD COLUMN IF NOT EXISTS reconciled_at TIMESTAMPTZ;
+    ADD COLUMN IF NOT EXISTS reconciled_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS request_fingerprint TEXT,
+    ADD COLUMN IF NOT EXISTS state_version BIGINT NOT NULL DEFAULT 0;
+UPDATE safe_v2_operations
+    SET request_fingerprint='legacy:' || client_order_id
+    WHERE request_fingerprint IS NULL;
+ALTER TABLE safe_v2_operations
+    ALTER COLUMN request_fingerprint SET NOT NULL;
 ALTER TABLE safe_v2_operations
     DROP CONSTRAINT IF EXISTS safe_v2_operations_status_check;
 ALTER TABLE safe_v2_operations
@@ -205,10 +228,12 @@ class PostgresRiskStore:
             order_id=str(row["alpaca_order_id"]) if row["alpaca_order_id"] else None,
             symbol=row["symbol"],
             asset_type=row["asset_type"],
+            request_fingerprint=row["request_fingerprint"],
             requested_notional=Decimal(row["requested_notional"]),
             reserved_notional=Decimal(row["reserved_notional"]),
             status=row["status"],
             uncertain=row["uncertain"],
+            state_version=row["state_version"],
             broker_status=row["broker_status"],
             reconciled_at=row["reconciled_at"],
         )
@@ -222,8 +247,10 @@ class PostgresRiskStore:
         client_order_id: str,
         symbol: str,
         asset_type: str,
+        request_fingerprint: str,
         requested_notional: Decimal,
         limits: RiskLimits,
+        now_utc: datetime | None = None,
     ) -> Reservation:
         pool = self._require_pool()
         try:
@@ -242,6 +269,7 @@ class PostgresRiskStore:
                         operation.client_order_id != client_order_id
                         or operation.symbol != symbol
                         or operation.asset_type != asset_type
+                        or operation.request_fingerprint != request_fingerprint
                         or operation.requested_notional != requested_notional
                     ):
                         raise RiskStoreError("Idempotency key was reused with different inputs")
@@ -256,11 +284,15 @@ class PostgresRiskStore:
                              (WHERE status = ANY($1::text[]) AND symbol=$2), 0)
                              AS symbol_notional,
                          COALESCE(SUM(requested_notional) FILTER
-                             (WHERE submitted_at >= CURRENT_DATE
+                             (WHERE submitted_at >=
+                                (date_trunc(
+                                    'day', COALESCE($3::timestamptz, NOW()) AT TIME ZONE 'UTC'
+                                 ) AT TIME ZONE 'UTC')
                               OR status='reserved'), 0) AS daily_notional
                        FROM safe_v2_operations""",
                     list(ACTIVE_STATUSES),
                     symbol,
+                    now_utc,
                 )
                 if int(totals["open_count"]) + 1 > limits.max_open_orders:
                     raise RiskLimitExceeded("Maximum Safe V2 open orders exceeded")
@@ -280,14 +312,16 @@ class PostgresRiskStore:
                 row = await connection.fetchrow(
                     """INSERT INTO safe_v2_operations
                        (principal, strategy_id, idempotency_key, client_order_id,
-                        symbol, asset_type, requested_notional, reserved_notional, status)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,$7,'reserved') RETURNING *""",
+                        symbol, asset_type, request_fingerprint, requested_notional,
+                        reserved_notional, status)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,'reserved') RETURNING *""",
                     principal,
                     strategy_id,
                     idempotency_key,
                     client_order_id,
                     symbol,
                     asset_type,
+                    request_fingerprint,
                     requested_notional,
                 )
                 return Reservation(operation=self._operation(row), created=True)
@@ -306,20 +340,26 @@ class PostgresRiskStore:
             raise RiskStoreError("Safe V2 ownership record is missing")
         return self._operation(row)
 
-    async def mark_submitted(self, client_order_id: str, order_id: str) -> Operation:
+    async def mark_submitted(
+        self, client_order_id: str, order_id: str, submitted_at: datetime | None = None
+    ) -> Operation:
         return await self._update(
             client_order_id,
             """UPDATE safe_v2_operations SET alpaca_order_id=$2::uuid,
-               status='submitted', uncertain=FALSE, submitted_at=NOW(), updated_at=NOW()
+               status='submitted', uncertain=FALSE,
+               submitted_at=COALESCE($3::timestamptz,NOW()), updated_at=NOW(),
+               state_version=state_version+1
                WHERE client_order_id=$1 AND status='reserved' RETURNING *""",
             order_id,
+            submitted_at,
         )
 
     async def mark_uncertain(self, client_order_id: str) -> None:
         await self._update(
             client_order_id,
             """UPDATE safe_v2_operations SET status='uncertain', uncertain=TRUE,
-               submitted_at=COALESCE(submitted_at,NOW()), updated_at=NOW()
+               submitted_at=COALESCE(submitted_at,NOW()), updated_at=NOW(),
+               state_version=state_version+1
                WHERE client_order_id=$1 AND status='reserved' RETURNING *""",
         )
 
@@ -327,7 +367,8 @@ class PostgresRiskStore:
         await self._update(
             client_order_id,
             """UPDATE safe_v2_operations SET status='rejected', reserved_notional=0,
-               updated_at=NOW() WHERE client_order_id=$1 AND status='reserved' RETURNING *""",
+               updated_at=NOW(), state_version=state_version+1
+               WHERE client_order_id=$1 AND status='reserved' RETURNING *""",
         )
 
     async def get_by_client_order_id(self, client_order_id: str) -> Operation | None:
@@ -360,7 +401,8 @@ class PostgresRiskStore:
         return await self._update(
             client_order_id,
             """UPDATE safe_v2_operations SET alpaca_order_id=$2::uuid,
-               status='submitted', uncertain=FALSE, updated_at=NOW()
+               status='submitted', uncertain=FALSE, updated_at=NOW(),
+               state_version=state_version+1
                WHERE client_order_id=$1 AND status='uncertain'
                  AND alpaca_order_id IS NULL RETURNING *""",
             order_id,
@@ -387,11 +429,11 @@ class PostgresRiskStore:
                            reconciled_at=NOW(), uncertain=FALSE,
                            submitted_at=COALESCE(submitted_at,NOW()),
                            reserved_notional=CASE WHEN $9 THEN 0 ELSE reserved_notional END,
-                           updated_at=NOW()
+                           updated_at=NOW(), state_version=state_version+1
                        WHERE client_order_id=$1 AND principal=$2 AND strategy_id=$3
                          AND symbol=$4
                          AND (alpaca_order_id IS NULL OR alpaca_order_id=$5::uuid)
-                         AND status = ANY($10::text[])
+                         AND status=$10 AND state_version=$11
                        RETURNING *""",
                     operation.client_order_id,
                     operation.principal,
@@ -402,7 +444,8 @@ class PostgresRiskStore:
                     target_status,
                     broker_status,
                     terminal,
-                    list(ACTIVE_STATUSES),
+                    operation.status,
+                    operation.state_version,
                 )
         except Exception as exc:
             raise RiskStoreError("Safe V2 verified reconciliation failed") from exc
@@ -414,15 +457,31 @@ class PostgresRiskStore:
         await self._update(
             client_order_id,
             """UPDATE safe_v2_operations SET status='cancelled', reserved_notional=0,
-               uncertain=FALSE, updated_at=NOW()
+               uncertain=FALSE, updated_at=NOW(), state_version=state_version+1
                WHERE client_order_id=$1
                  AND status IN ('submitted', 'cancel_uncertain') RETURNING *""",
+        )
+
+    async def begin_cancel(self, client_order_id: str) -> Operation:
+        return await self._update(
+            client_order_id,
+            """UPDATE safe_v2_operations SET status='cancel_uncertain', uncertain=TRUE,
+               updated_at=NOW(), state_version=state_version+1
+               WHERE client_order_id=$1 AND status='submitted' RETURNING *""",
+        )
+
+    async def mark_cancel_rejected(self, client_order_id: str) -> Operation:
+        return await self._update(
+            client_order_id,
+            """UPDATE safe_v2_operations SET status='submitted', uncertain=FALSE,
+               updated_at=NOW(), state_version=state_version+1
+               WHERE client_order_id=$1 AND status='cancel_uncertain' RETURNING *""",
         )
 
     async def mark_cancel_uncertain(self, client_order_id: str) -> None:
         await self._update(
             client_order_id,
             """UPDATE safe_v2_operations SET status='cancel_uncertain', uncertain=TRUE,
-               updated_at=NOW() WHERE client_order_id=$1
+               updated_at=NOW(), state_version=state_version+1 WHERE client_order_id=$1
                  AND status='submitted' RETURNING *""",
         )

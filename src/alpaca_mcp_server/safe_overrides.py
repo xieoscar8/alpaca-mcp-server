@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 import re
 from decimal import Decimal, InvalidOperation
@@ -93,6 +94,21 @@ def _symbol(value: object, crypto: bool) -> bool:
     if not isinstance(value, str) or not value or value != value.strip() or not value.isprintable():
         return False
     return (CRYPTO_RE if crypto else STOCK_RE).fullmatch(value) is not None
+
+
+def _canonical_symbol(value: str) -> str:
+    """Collapse only broker-safe case-equivalent symbol forms."""
+    return value.upper()
+
+
+def _decimal_text(value: Decimal) -> str:
+    return format(value.normalize(), "f")
+
+
+def _request_fingerprint(*, body: dict[str, str], asset_type: str) -> str:
+    intent = {"asset_type": asset_type, **body}
+    serialized = json.dumps(intent, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(serialized.encode()).hexdigest()
 
 
 def _owner_field(value: object) -> bool:
@@ -226,6 +242,7 @@ async def _reserve(
             principal=principal,
         )
     client_order_id = _client_id(secret, principal, strategy, key)
+    request_fingerprint = _request_fingerprint(body=body, asset_type=asset_type)
     try:
         reservation = await store.reserve(
             principal=principal,
@@ -234,6 +251,7 @@ async def _reserve(
             client_order_id=client_order_id,
             symbol=symbol,
             asset_type=asset_type,
+            request_fingerprint=request_fingerprint,
             requested_notional=estimated,
             limits=_limits(),
         )
@@ -280,6 +298,7 @@ def register_safe_trading_tools(
             return _error("Safe Trading V2 write operations are Paper-only.")
         if not _symbol(symbol, False):
             return _error("Invalid single stock symbol")
+        symbol = _canonical_symbol(symbol)
         if side != "buy":
             return _error("Safe stock orders only allow side=buy")
         if type != "limit":
@@ -305,8 +324,8 @@ def register_safe_trading_tools(
             "side": "buy",
             "type": "limit",
             "time_in_force": time_in_force,
-            "limit_price": str(limit_price),
-            "qty" if qty is not None else "notional": str(amount_input),
+            "limit_price": _decimal_text(price),
+            "qty" if qty is not None else "notional": _decimal_text(amount),
         }
         return await _reserve(
             client=client,
@@ -339,6 +358,7 @@ def register_safe_trading_tools(
             return _error("Safe Trading V2 write operations are Paper-only.")
         if not _symbol(symbol, True):
             return _error("Invalid single crypto pair")
+        symbol = _canonical_symbol(symbol)
         if side != "buy":
             return _error("Safe crypto orders only allow side=buy")
         if type != "limit":
@@ -364,8 +384,8 @@ def register_safe_trading_tools(
             "side": "buy",
             "type": "limit",
             "time_in_force": time_in_force,
-            "limit_price": str(limit_price),
-            "qty" if qty is not None else "notional": str(amount_input),
+            "limit_price": _decimal_text(price),
+            "qty" if qty is not None else "notional": _decimal_text(amount),
         }
         return await _reserve(
             client=client,
@@ -399,7 +419,7 @@ def register_safe_trading_tools(
         path = f"/v2/orders/{quote(order_id, safe='')}"
         try:
             response = await client.get(path)
-        except httpx.ReadTimeout:
+        except httpx.RequestError:
             return _error("Order pre-check timed out")
         if response.is_error:
             return _error("Order pre-check failed")
@@ -431,14 +451,24 @@ def register_safe_trading_tools(
         if operation.order_id != order_id or operation.client_order_id != client_id:
             return _error("Alpaca and ownership records mismatch")
         try:
+            await store.begin_cancel(client_id)
+        except RiskStoreError:
+            return _error("Cancellation reservation failed; DELETE was not sent")
+        try:
             deleted = await client.delete(path)
-        except httpx.ReadTimeout:
-            try:
-                await store.mark_cancel_uncertain(client_id)
-            except RiskStoreError:
-                pass
+        except httpx.RequestError:
             return _error("Cancellation MAY have been submitted", uncertain=True)
+        if deleted.status_code == 408 or deleted.status_code >= 500:
+            return _error(
+                "Cancellation MAY have been submitted",
+                uncertain=True,
+                http_status=deleted.status_code,
+            )
         if deleted.is_error:
+            try:
+                await store.mark_cancel_rejected(client_id)
+            except RiskStoreError:
+                return _error("Cancellation rejection persistence failed", uncertain=True)
             return _error("API rejected cancellation", http_status=deleted.status_code)
         try:
             await store.mark_cancelled(client_id)

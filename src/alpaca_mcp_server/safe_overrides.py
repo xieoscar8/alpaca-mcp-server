@@ -13,7 +13,7 @@ from urllib.parse import quote
 import httpx
 from fastmcp import FastMCP
 
-from .authentication import PrincipalError, PrincipalProvider
+from .authentication import PrincipalError, PrincipalProvider, has_paper_trading_permission
 from .reconciliation import reconcile_pending
 from .risk_store import Operation, RiskLimitExceeded, RiskLimits, RiskStore, RiskStoreError
 
@@ -294,6 +294,8 @@ def register_safe_trading_tools(
         limit_price: str | None = None,
     ) -> dict:
         """Place a V2-owned cumulative-risk-limited stock order."""
+        if not has_paper_trading_permission():
+            return _error("Safe Trading requires paper-trading permission")
         if not _paper():
             return _error("Safe Trading V2 write operations are Paper-only.")
         if not _symbol(symbol, False):
@@ -354,6 +356,8 @@ def register_safe_trading_tools(
         limit_price: str | None = None,
     ) -> dict:
         """Place a V2-owned cumulative-risk-limited crypto order."""
+        if not has_paper_trading_permission():
+            return _error("Safe Trading requires paper-trading permission")
         if not _paper():
             return _error("Safe Trading V2 write operations are Paper-only.")
         if not _symbol(symbol, True):
@@ -404,6 +408,8 @@ def register_safe_trading_tools(
     @server.tool(annotations={"title": "Safely Cancel Owned Order", **annotations})
     async def safe_cancel_order(order_id: str, strategy_id: str) -> dict:
         """Cancel one order proven to belong to this principal and strategy."""
+        if not has_paper_trading_permission():
+            return _error("Safe Trading requires paper-trading permission")
         if not _paper():
             return _error("Safe Trading V2 write operations are Paper-only.")
         if not ORDER_ID_RE.fullmatch(order_id):

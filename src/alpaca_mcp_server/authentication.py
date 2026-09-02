@@ -30,6 +30,31 @@ class PrincipalError(RuntimeError):
 
 PrincipalProvider = Callable[[], str]
 
+
+def has_paper_trading_permission() -> bool:
+    """Authorize only from this request's verified token permissions snapshot.
+
+    Role changes require refreshed claims; this is not immediate revocation.
+    Missing context, including local/stdio calls, never grants write permission.
+    """
+    try:
+        token = get_access_token()
+        if token is None or not isinstance(token.claims, dict):
+            return False
+        permissions = token.claims.get("permissions")
+        return (
+            isinstance(permissions, list)
+            and bool(permissions)
+            and all(
+                isinstance(item, str) and item and item == item.strip()
+                for item in permissions
+            )
+            and "paper-trading" in permissions
+        )
+    except Exception:
+        return False
+
+
 # Bound ordinary clock drift without granting minutes of premature token use.
 # Server-only policy: never sourced from request arguments or environment variables.
 JWT_CLOCK_SKEW_SECONDS = 60

@@ -6,6 +6,7 @@ import asyncio
 import json
 from dataclasses import replace
 from decimal import Decimal
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -27,6 +28,10 @@ ORDER_1 = "123e4567-e89b-42d3-a456-426614174000"
 
 @pytest.fixture(autouse=True)
 def safe_env(monkeypatch):
+    monkeypatch.setattr(
+        "alpaca_mcp_server.authentication.get_access_token",
+        lambda: SimpleNamespace(claims={"permissions": ["paper-trading"]}),
+    )
     monkeypatch.setenv("ALPACA_PAPER_TRADE", "true")
     monkeypatch.setenv("ALPACA_SAFE_PRINCIPAL", "principal-a")
     monkeypatch.setenv(

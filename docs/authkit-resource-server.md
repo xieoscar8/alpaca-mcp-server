@@ -67,3 +67,20 @@ only, with no Safe write handler invoked and no Alpaca API calls. Test token
 refresh, reconnect, server restart, JWKS failure/rotation and risk DB restart
 before any deployment approval. Paper-only, exactly three Safe writes and the
 disabled close-position tool remain unchanged.
+
+## Paper-write authorization
+
+Authentication alone does not authorize trading. Each of the three Safe V2
+write handlers checks the current verified access token's `permissions` list
+for the exact, case-sensitive `paper-trading` permission before validation,
+reconciliation, principal lookup, RiskStore access, or broker access. Missing
+context or malformed permissions deny writes, including local/stdio calls.
+Roles, scopes, tool arguments and request parameters cannot grant this permission.
+Read-only tools retain the existing authentication requirements without this gate.
+All existing Paper-only, ownership and cumulative-risk controls still apply.
+
+Permissions are a signed JWT snapshot, not a live WorkOS lookup. Removing a role
+or permission does not immediately revoke an already-issued token. Clients must
+obtain and present updated tokens; no immediate session revocation is promised.
+Real WorkOS permission-claim issuance and permission refresh must be validated
+separately without trading. This patch does not deploy or configure the provider.

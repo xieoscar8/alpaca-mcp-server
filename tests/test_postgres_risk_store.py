@@ -8,6 +8,10 @@ from decimal import Decimal
 import asyncpg
 import pytest
 import pytest_asyncio
+from key_value.aio.stores.postgresql import PostgreSQLStore
+from fastmcp.server.auth.oauth_proxy import OAuthProxy
+from fastmcp.server.auth.oauth_proxy.models import OAuthTransaction, UpstreamTokenSet
+from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 
 from alpaca_mcp_server.risk_store import (
     PostgresRiskStore,
@@ -279,7 +283,9 @@ async def test_17_concurrent_case_variants_share_symbol_limit(store, variants):
         return_exceptions=True,
     )
     assert sum(not isinstance(result, Exception) for result in results) == 2
-    assert isinstance(results[2], RiskLimitExceeded)
+    # Advisory-lock acquisition order is intentionally unspecified.
+    failures = [result for result in results if isinstance(result, Exception)]
+    assert len(failures) == 1 and isinstance(failures[0], RiskLimitExceeded)
 
 
 @pytest.mark.asyncio
@@ -396,3 +402,56 @@ async def test_22_stale_reconciliation_cannot_reopen_terminal_state(store, termi
         )
     current = await store.get_by_client_order_id(created.operation.client_order_id)
     assert current.status == terminal_status and current.reserved_notional == 0
+
+
+@pytest.mark.asyncio
+async def test_23_fastmcp_oauth_state_store_survives_reopen(store):
+    table_name = "safe_v2_oauth_state_test"
+    admin = await asyncpg.connect(DSN)
+    await admin.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+    await admin.close()
+
+    first = PostgreSQLStore(url=DSN, table_name=table_name)
+    def proxy(storage):
+        return OAuthProxy(
+            upstream_authorization_endpoint="https://idp.example/authorize",
+            upstream_token_endpoint="https://idp.example/token",
+            upstream_client_id="test-app",
+            upstream_client_secret="test-only-client-secret",
+            token_verifier=StaticTokenVerifier({}),
+            base_url="https://mcp.example",
+            client_storage=storage,
+            jwt_signing_key="test-only-signing-key-with-at-least-32-characters",
+            require_authorization_consent=True,
+        )
+
+    original = proxy(first)
+    transaction = OAuthTransaction(
+        txn_id="txn", client_id="claude-test", client_redirect_uri="https://claude.ai/callback",
+        client_state="state", code_challenge="challenge", code_challenge_method="S256",
+        scopes=["openid"], created_at=1, consent_token="test-consent-binding",
+    )
+    upstream = UpstreamTokenSet(
+        upstream_token_id="upstream", access_token="test-access-token-not-real",
+        refresh_token="test-refresh-token-not-real", refresh_token_expires_at=None,
+        expires_at=4102444800, token_type="Bearer", scope="openid", client_id="claude-test",
+        created_at=1,
+    )
+    await original._transaction_store.put(key="txn", value=transaction)
+    await original._upstream_token_store.put(key="upstream", value=upstream)
+    await first.put(
+        "client-registration",
+        {"client_id": "claude-test", "redirect_uri": "https://claude.ai/callback"},
+        collection="mcp-clients",
+    )
+    await first.close()
+
+    reopened = PostgreSQLStore(url=DSN, table_name=table_name)
+    restarted = proxy(reopened)
+    assert await restarted._transaction_store.get(key="txn") == transaction
+    assert await restarted._upstream_token_store.get(key="upstream") == upstream
+    assert await reopened.get("client-registration", collection="mcp-clients") == {
+        "client_id": "claude-test",
+        "redirect_uri": "https://claude.ai/callback",
+    }
+    await reopened.close()

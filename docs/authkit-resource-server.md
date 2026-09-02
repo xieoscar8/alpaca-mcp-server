@@ -122,13 +122,34 @@ final status `canceled`, `filled_qty=0`, and no BTC/USD position. Temporary
 authentication diagnostics were removed. Post-cleanup read-only BTC/USD and
 AAPL calls also passed.
 
-Those external smoke results predate the latest local security remediation;
-they do not claim that the current uncommitted patch has been deployed or
-revalidated against a real broker.
+The latest security remediation, commit
+`dc610e8bd2d095eed2fa619be6618eea63ca0c5e`
+(`Harden Paper-only trading safety`), has also been deployed to V2 TEST and
+passed post-deployment validation:
+
+- Authenticated read-only acceptance passed, including BTC/USD and AAPL access.
+- The visible write surface remained exactly `safe_place_stock_order`,
+  `safe_place_crypto_order`, and `safe_cancel_order`. `safe_close_position`,
+  legacy/raw trading writes, and `debug_auth_claims_summary` were absent.
+- A real Paper AAPL BUY LIMIT order with qty=20 and limit_price=$1 passed equity
+  preflight and was accepted, with requested/estimated notional=$20 and a
+  server-derived `safe-v2-` client_order_id. `filled_qty=0`; no fill resulted.
+- `safe_cancel_order` was called exactly once. Its write response conservatively
+  returned `cancel_uncertain` / `uncertain=true`, not terminal cancellation.
+  A subsequent read-only broker lookup reported `canceled`, with filled_qty
+  still zero. No repeated cancel occurred.
+
+The broker's terminal canceled observation does not by itself prove that internal
+RiskStore reconciliation completed or that the reservation was released. That
+internal behavior is supported separately by source review and real local
+PostgreSQL tests.
+
+Final independent audit verdict for the remediation: **PASS FOR PAPER-ONLY MERGE**.
+This verdict does not itself authorize or perform a merge.
 
 These results validate V2 TEST, not Live readiness or production approval.
-Live trading / production-live deployment is NOT approved. Final security/release
-review is still required before merge. This smoke test does not establish every
+LIVE TRADING IS NOT APPROVED. Production-live deployment is not approved.
+This smoke test does not establish every
 token-refresh, revocation, restart, or JWKS failure/rotation scenario. DCR is not
 claimed validated by the CIMD result. Authentication remains separate from trading
 authorization; required scopes must not be weakened to make login succeed.

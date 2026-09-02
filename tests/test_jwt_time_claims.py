@@ -1,20 +1,16 @@
-"""Verified-claims gate, real signed token swap/refresh, and principal exclusion."""
+"""Direct verified JWTs, refreshed access tokens, and principal exclusion."""
 
 import time
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 import pytest
 from authlib.jose import jwt
-from fastmcp.server.auth import OIDCProxy
-from fastmcp.server.auth.oauth_proxy.models import JTIMapping, UpstreamTokenSet
-from fastmcp.server.auth.oidc_proxy import OIDCConfiguration
-from fastmcp.server.auth.providers.jwt import JWTVerifier, RSAKeyPair
-from key_value.aio.stores.memory import MemoryStore
+from fastmcp.server.auth.providers.jwt import RSAKeyPair
 
 from alpaca_mcp_server import authentication
 
 ISSUER = "https://issuer.example"
-AUDIENCE = "https://mcp.example"
+AUDIENCE = "https://mcp.example/mcp"
 NOW = 2_000_000_000
 MISSING = object()
 INVALID = ["2000000600", True, False, None, float("nan"), float("inf"),
@@ -55,33 +51,18 @@ def test_optional_time_boundary(monkeypatch, claim, value, allowed):
 
 
 @pytest.fixture
-def signed_proxy(monkeypatch):
-    """Real project OIDC adapter, RSA verifier, and proxy stores; no IdP network."""
+def signed_provider(monkeypatch):
+    """Real direct adapter and default RSA verifier; only JWKS I/O is mocked."""
     keys = RSAKeyPair.generate()
     now = int(time.time())
     monkeypatch.setattr(authentication.time, "time", lambda: now)
     monkeypatch.setenv("ALPACA_MCP_OIDC_AUDIENCE", AUDIENCE)
-    discovery = OIDCConfiguration(
-        issuer=ISSUER, authorization_endpoint=ISSUER + "/authorize",
-        token_endpoint=ISSUER + "/token", jwks_uri=ISSUER + "/jwks",
-        response_types_supported=["code"], subject_types_supported=["public"],
-        id_token_signing_alg_values_supported=["RS256"],
+    provider = authentication.HardenedAuthKitProvider(
+        issuer=ISSUER, base_url="https://mcp.example", audience=AUDIENCE,
+        required_scopes=["openid"],
     )
-    monkeypatch.setattr(OIDCProxy, "get_oidc_configuration", lambda *args: discovery)
-    provider = authentication.SubjectBoundOIDCProxy(
-        config_url=ISSUER + "/.well-known/openid-configuration",
-        client_id="test-app", client_secret="test-only-secret", audience=AUDIENCE,
-        base_url=AUDIENCE, required_scopes=["openid"], verify_id_token=False,
-        client_storage=MemoryStore(),
-        jwt_signing_key="test-only-signing-key-with-at-least-32-characters",
-        forward_resource=False, extra_token_params={"resource": AUDIENCE},
-    )
-    # Static public key instead of remote JWKS; all signature/claim verification
-    # and the installed OAuthProxy.load_access_token implementation remain real.
-    provider._token_validator = JWTVerifier(
-        public_key=keys.public_key, issuer=ISSUER, audience=AUDIENCE,
-        algorithm="RS256", required_scopes=["openid"],
-    )
+    monkeypatch.setattr(provider.token_verifier, "_get_verification_key",
+                        AsyncMock(return_value=keys.public_key))
     provider.get_routes(mcp_path="/mcp")
 
     def sign(overrides=None, missing=None):
@@ -91,26 +72,11 @@ def signed_proxy(monkeypatch):
         claims.pop(missing, None)
         return jwt.encode({"alg": "RS256"}, claims, keys.private_key.get_secret_value()).decode()
 
-    async def reference(upstream, *, refresh=False):
-        await provider._upstream_token_store.put(key="upstream", value=UpstreamTokenSet(
-            upstream_token_id="upstream", access_token=upstream,
-            refresh_token="test-only-refresh" if refresh else None,
-            refresh_token_expires_at=now + 3600 if refresh else None,
-            expires_at=now - 300 if refresh else now + 600,
-            token_type="Bearer", scope="openid", client_id="same-client", created_at=now,
-        ))
-        await provider._jti_mapping_store.put(key="reference", value=JTIMapping(
-            jti="reference", upstream_token_id="upstream", created_at=now,
-        ))
-        return provider.jwt_issuer.issue_access_token(
-            client_id="same-client", scopes=["openid"], jti="reference", expires_in=600,
-        )
-
-    return provider, sign, reference, now
+    return provider, sign, now
 
 
 async def assert_no_principal(monkeypatch, provider, bearer):
-    value = await provider.load_access_token(bearer)
+    value = await provider.verify_token(bearer)
     assert value is None  # authentication middleware never receives an identity
     monkeypatch.setattr(authentication, "get_access_token", lambda: value)
     with pytest.raises(authentication.PrincipalError):
@@ -120,10 +86,10 @@ async def assert_no_principal(monkeypatch, provider, bearer):
 @pytest.mark.parametrize("claim", ["exp", "nbf", "iat"])
 @pytest.mark.parametrize("value", INVALID)
 async def test_signed_malformed_time_never_creates_principal(
-    monkeypatch, signed_proxy, claim, value,
+    monkeypatch, signed_provider, claim, value,
 ):
-    provider, sign, reference, _ = signed_proxy
-    await assert_no_principal(monkeypatch, provider, await reference(sign({claim: value})))
+    provider, sign, _ = signed_provider
+    await assert_no_principal(monkeypatch, provider, sign({claim: value}))
 
 
 @pytest.mark.parametrize("case,allowed", [
@@ -132,8 +98,8 @@ async def test_signed_malformed_time_never_creates_principal(
     ("future-nbf", False), ("skew-nbf", True), ("missing-iat", True),
     ("past-iat", True), ("future-iat", False), ("skew-iat", True),
 ])
-async def test_signed_time_policy(monkeypatch, signed_proxy, case, allowed):
-    provider, sign, reference, now = signed_proxy
+async def test_signed_time_policy(monkeypatch, signed_provider, case, allowed):
+    provider, sign, now = signed_provider
     overrides = {
         "expired": {"exp": now - 300}, "expired-inside-skew": {"exp": now - 1},
         "fractional": {"exp": now + 600.5}, "past-nbf": {"nbf": now - 300},
@@ -142,11 +108,11 @@ async def test_signed_time_policy(monkeypatch, signed_proxy, case, allowed):
         "skew-iat": {"iat": now + 60},
     }.get(case, {})
     missing = case.removeprefix("missing-") if case.startswith("missing-") else None
-    bearer = await reference(sign(overrides, missing))
+    bearer = sign(overrides, missing)
     if not allowed:
         await assert_no_principal(monkeypatch, provider, bearer)
     else:
-        value = await provider.load_access_token(bearer)
+        value = await provider.verify_token(bearer)
         assert value is not None and value.subject == "user-a"
         monkeypatch.setattr(authentication, "get_access_token", lambda: value)
         assert authentication.authenticated_principal().startswith("oauth-v2-")
@@ -156,22 +122,23 @@ async def test_signed_time_policy(monkeypatch, signed_proxy, case, allowed):
     ("valid", True), ("missing-exp", False), ("future-nbf", False),
     ("future-iat", False), ("malformed", False), ("expired", False),
 ])
-async def test_real_transparent_refresh_obeys_time_gate(
-    monkeypatch, signed_proxy, case, allowed,
+async def test_refreshed_access_token_obeys_time_gate_without_cached_identity(
+    monkeypatch, signed_provider, case, allowed,
 ):
-    provider, sign, reference, now = signed_proxy
+    # Refresh belongs to WorkOS/Claude now. Present successive signed access
+    # tokens directly; do not emulate a server-side token endpoint or refresh.
+    provider, sign, now = signed_provider
+    original = await provider.verify_token(sign())
+    assert original is not None
+    monkeypatch.setattr(authentication, "get_access_token", lambda: original)
+    principal = authentication.authenticated_principal()
     overrides = {"future-nbf": {"nbf": now + 300}, "future-iat": {"iat": now + 300},
                  "malformed": {"exp": None}, "expired": {"exp": now - 300}}.get(case, {})
     refreshed = sign(overrides, "exp" if case == "missing-exp" else None)
-    upstream = Mock(refresh_token=AsyncMock(return_value={
-        "access_token": refreshed, "refresh_token": "test-only-rotated-refresh",
-        "expires_in": 600,
-    }))
-    monkeypatch.setattr(provider, "_create_upstream_oauth_client", lambda: upstream)
-    bearer = await reference(sign({"exp": now - 300}), refresh=True)
     if allowed:
-        assert (await provider.load_access_token(bearer)).subject == "user-a"
+        value = await provider.verify_token(refreshed)
+        assert value.subject == "user-a"
+        monkeypatch.setattr(authentication, "get_access_token", lambda: value)
+        assert authentication.authenticated_principal() == principal
     else:
-        await assert_no_principal(monkeypatch, provider, bearer)
-    upstream.refresh_token.assert_awaited_once()
-    assert upstream.refresh_token.call_args.kwargs["resource"] == AUDIENCE
+        await assert_no_principal(monkeypatch, provider, refreshed)

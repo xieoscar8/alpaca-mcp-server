@@ -15,7 +15,7 @@ from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from fastmcp.server.auth.providers.jwt import JWTVerifier
 from fastmcp.server.auth.oauth_proxy import OAuthProxy
 from fastmcp.server.auth.oauth_proxy.models import OAuthTransaction
-from fastmcp.server.auth.oidc_proxy import OIDCConfiguration, OIDCProxy
+from fastmcp.server.auth.providers.workos import AuthKitProvider
 from key_value.aio.stores.memory import MemoryStore
 from starlette.requests import Request
 from starlette.applications import Starlette
@@ -34,6 +34,13 @@ from alpaca_mcp_server.server import build_server
 
 
 AUDIENCE = "https://mcp.example/mcp"
+
+
+def direct_provider():
+    return authentication.HardenedAuthKitProvider(
+        issuer="https://issuer.example", base_url="https://mcp.example",
+        audience=AUDIENCE, required_scopes=["openid"],
+    )
 
 
 @pytest.mark.parametrize("body,expected", [
@@ -161,9 +168,8 @@ async def test_subject_bridge_rejects_explicit_invalid_subject(monkeypatch, subj
                         claims={"iss": "https://issuer.example", "sub": "user-1",
                                 "aud": AUDIENCE, "exp": time.time() + 300})
     monkeypatch.setenv("ALPACA_MCP_OIDC_AUDIENCE", AUDIENCE)
-    monkeypatch.setattr(OIDCProxy, "load_access_token", AsyncMock(return_value=value))
-    provider = object.__new__(authentication.SubjectBoundOIDCProxy)
-    assert await provider.load_access_token("test") is None
+    monkeypatch.setattr(AuthKitProvider, "verify_token", AsyncMock(return_value=value))
+    assert await direct_provider().verify_token("test") is None
 
 
 @pytest.mark.asyncio
@@ -179,9 +185,8 @@ async def test_subject_bridge_rejects_malformed_verified_claims(monkeypatch, ove
         "exp": time.time() + 300, **overrides,
     })
     monkeypatch.setenv("ALPACA_MCP_OIDC_AUDIENCE", AUDIENCE)
-    monkeypatch.setattr(OIDCProxy, "load_access_token", AsyncMock(return_value=value))
-    provider = object.__new__(authentication.SubjectBoundOIDCProxy)
-    assert await provider.load_access_token("test") is None
+    monkeypatch.setattr(AuthKitProvider, "verify_token", AsyncMock(return_value=value))
+    assert await direct_provider().verify_token("test") is None
 
 
 def test_stateful_session_binds_verified_user_not_only_oauth_client(
@@ -190,24 +195,11 @@ def test_stateful_session_binds_verified_user_not_only_oauth_client(
     from fastmcp import FastMCP
 
     private_key, public_key = oidc_jwt_material
-    discovery = OIDCConfiguration(
-        issuer="https://issuer.example", authorization_endpoint="https://issuer.example/authorize",
-        token_endpoint="https://issuer.example/token", jwks_uri="https://issuer.example/jwks",
-        response_types_supported=["code"], subject_types_supported=["public"],
-        id_token_signing_alg_values_supported=["RS256"],
-    )
-    monkeypatch.setattr(OIDCProxy, "get_oidc_configuration", lambda *args: discovery)
-    monkeypatch.setattr(authentication, "PostgreSQLStore", lambda **kwargs: MemoryStore())
-    verifier = JWTVerifier(public_key=public_key, issuer="https://issuer.example",
-                           audience=AUDIENCE, algorithm="RS256")
-
-    async def verified_upstream(self, value):
-        return await verifier.verify_token(value)
-
-    # Only bypass proxy-token storage/exchange; signatures, subject bridge,
-    # authentication middleware and the stateful HTTP session manager are real.
-    monkeypatch.setattr(OIDCProxy, "load_access_token", verified_upstream)
     provider = build_managed_oidc_provider()
+    # Only JWKS retrieval is mocked. Direct JWT verification, project guards
+    # and the stateful HTTP session manager are all real.
+    monkeypatch.setattr(provider.token_verifier, "_get_verification_key",
+                        AsyncMock(return_value=public_key))
     app = FastMCP("session-test", auth=provider).http_app(
         path="/mcp", stateless_http=False, json_response=True,
     )
@@ -314,11 +306,10 @@ def test_hosted_ownership_secret_must_be_strong(monkeypatch, secret):
         build_server(hosted_mode=True, auth_provider=verifier)
 
 
-def test_hosted_secrets_must_be_independent(monkeypatch):
-    shared = "shared-secret-with-enough-variety-123456789"
-    monkeypatch.setenv("ALPACA_SAFE_OWNERSHIP_SECRET", shared)
-    monkeypatch.setenv("ALPACA_MCP_JWT_SIGNING_KEY", shared)
-    with pytest.raises(AuthenticationConfigurationError):
+def test_hosted_risk_database_still_required(monkeypatch):
+    monkeypatch.setenv("ALPACA_SAFE_OWNERSHIP_SECRET", "strong-test-ownership-secret-123456789")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    with pytest.raises(AuthenticationConfigurationError, match="risk database"):
         build_server(hosted_mode=True, auth_provider=StaticTokenVerifier({}))
 
 
@@ -326,13 +317,9 @@ def test_hosted_secrets_must_be_independent(monkeypatch):
 def configured_oidc_env(monkeypatch):
     values = {
         "ALPACA_MCP_OAUTH_SCOPES": "alpaca:read alpaca:safe-write",
-        "ALPACA_MCP_OIDC_CONFIG_URL": "https://idp.example/.well-known/openid-configuration",
-        "ALPACA_MCP_OIDC_CLIENT_ID": "client",
-        "ALPACA_MCP_OIDC_CLIENT_SECRET": "secret",
+        "ALPACA_MCP_AUTHKIT_ISSUER": "https://issuer.example",
         "ALPACA_MCP_OIDC_AUDIENCE": AUDIENCE,
         "ALPACA_MCP_PUBLIC_BASE_URL": "https://mcp.example",
-        "ALPACA_MCP_JWT_SIGNING_KEY": "test-signing-key-with-32-plus-characters-123",
-        "DATABASE_URL": "postgresql://test:test@localhost/test",
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
@@ -340,21 +327,13 @@ def configured_oidc_env(monkeypatch):
 
 def test_managed_oidc_provider_uses_locked_fastmcp_architecture(monkeypatch, configured_oidc_env):
     constructor = Mock(return_value=Mock())
-    storage = Mock(return_value=Mock())
-    monkeypatch.setattr(authentication, "SubjectBoundOIDCProxy", constructor)
-    monkeypatch.setattr(authentication, "PostgreSQLStore", storage)
+    monkeypatch.setattr(authentication, "HardenedAuthKitProvider", constructor)
     assert build_managed_oidc_provider() is constructor.return_value
     kwargs = constructor.call_args.kwargs
     assert kwargs["required_scopes"] == ["alpaca:read", "alpaca:safe-write"]
     assert kwargs["audience"] == AUDIENCE
-    assert kwargs["verify_id_token"] is False
-    assert kwargs["forward_resource"] is False
-    assert kwargs["extra_authorize_params"] == {"resource": AUDIENCE}
-    assert kwargs["extra_token_params"] == {"resource": AUDIENCE}
-    assert kwargs["redirect_path"] == "/auth/callback"
-    assert kwargs["client_storage"] is storage.return_value
-    assert kwargs["jwt_signing_key"] == "test-signing-key-with-32-plus-characters-123"
-    assert kwargs["require_authorization_consent"] is True
+    assert kwargs["issuer"] == "https://issuer.example"
+    assert set(kwargs) == {"issuer", "base_url", "audience", "required_scopes"}
 
 
 @pytest.mark.parametrize("audience", [None, "", " ", " https://mcp.example/mcp"])
@@ -364,37 +343,23 @@ def test_hosted_requires_configured_audience(monkeypatch, configured_oidc_env, a
     else:
         monkeypatch.setenv("ALPACA_MCP_OIDC_AUDIENCE", audience)
     constructor = Mock()
-    monkeypatch.setattr(authentication, "SubjectBoundOIDCProxy", constructor)
-    monkeypatch.setattr(authentication, "PostgreSQLStore", Mock())
+    monkeypatch.setattr(authentication, "HardenedAuthKitProvider", constructor)
     with pytest.raises(AuthenticationConfigurationError):
         build_managed_oidc_provider()
     constructor.assert_not_called()
 
 
-def test_real_oidc_proxy_wires_jwks_issuer_audience_and_resource(
+def test_real_authkit_wires_jwks_issuer_audience_and_resource(
     monkeypatch, configured_oidc_env
 ):
-    discovery = OIDCConfiguration(
-        issuer="https://issuer.example",
-        authorization_endpoint="https://issuer.example/authorize",
-        token_endpoint="https://issuer.example/token",
-        jwks_uri="https://issuer.example/jwks",
-        response_types_supported=["code"],
-        subject_types_supported=["public"],
-        id_token_signing_alg_values_supported=["RS256"],
-    )
-    monkeypatch.setattr(OIDCProxy, "get_oidc_configuration", lambda *args: discovery)
-    monkeypatch.setattr(authentication, "PostgreSQLStore", lambda **kwargs: MemoryStore())
+    monkeypatch.delenv("DATABASE_URL", raising=False)
     provider = build_managed_oidc_provider()
-    assert isinstance(provider, OIDCProxy)
-    assert provider._token_validator.audience == AUDIENCE
-    assert provider._token_validator.issuer == "https://issuer.example"
-    assert provider._token_validator.jwks_uri == "https://issuer.example/jwks"
-    assert provider._token_validator.required_scopes == ["alpaca:read", "alpaca:safe-write"]
-    assert provider._verify_id_token is False
-    assert provider._forward_resource is False
-    assert provider._extra_authorize_params["resource"] == AUDIENCE
-    assert provider._extra_token_params["resource"] == AUDIENCE
+    assert isinstance(provider, AuthKitProvider) and not isinstance(provider, OAuthProxy)
+    assert provider.token_verifier.audience == AUDIENCE
+    assert provider.token_verifier.issuer == "https://issuer.example"
+    assert provider.token_verifier.jwks_uri == "https://issuer.example/oauth2/jwks"
+    assert provider.token_verifier.required_scopes == ["alpaca:read", "alpaca:safe-write"]
+    assert not hasattr(provider, "_client_storage")
     provider.set_mcp_path("/mcp")
     assert str(provider._resource_url) == AUDIENCE
 
@@ -546,9 +511,8 @@ async def test_real_access_token_claims_drive_principal_not_client_id(
     value = await verifier.verify_token(_signed_token(private_key, client_id="client-a"))
     assert value is not None
     monkeypatch.setenv("ALPACA_MCP_OIDC_AUDIENCE", AUDIENCE)
-    monkeypatch.setattr(OIDCProxy, "load_access_token", AsyncMock(return_value=value))
-    provider = object.__new__(authentication.SubjectBoundOIDCProxy)
-    value = await provider.load_access_token("mock-proxy-token")
+    monkeypatch.setattr(AuthKitProvider, "verify_token", AsyncMock(return_value=value))
+    value = await direct_provider().verify_token("mock-verified-token")
     assert value is not None and value.subject == "user-1"
     monkeypatch.setattr(authentication, "get_access_token", lambda: value)
     first = authenticated_principal()
@@ -633,6 +597,8 @@ def test_remote_endpoint_protects_initialize_list_and_call(monkeypatch):
     )
     server = build_server(
         hosted_mode=True,
+        risk_store=Mock(open=AsyncMock(), close=AsyncMock(),
+                        list_reconcilable=AsyncMock(return_value=[])),
         auth_provider=verifier,
         principal_provider=lambda: "test-principal",
     )

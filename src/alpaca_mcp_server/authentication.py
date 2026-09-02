@@ -5,13 +5,19 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import re
 import time
 from collections.abc import Callable
+from urllib.parse import urlsplit
 
-from fastmcp.server.auth import AuthProvider, OIDCProxy
+from fastmcp.server.auth import AuthProvider
 from fastmcp.server.auth.auth import AccessToken
+from fastmcp.server.auth.providers.workos import AuthKitProvider
 from fastmcp.server.dependencies import get_access_token
-from key_value.aio.stores.postgresql import PostgreSQLStore
+from mcp.server.auth.routes import cors_middleware
+from pydantic import AnyHttpUrl
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 
 
 class AuthenticationConfigurationError(RuntimeError):
@@ -57,26 +63,96 @@ def _valid_time_claims(claims: dict) -> bool:
     return True
 
 
-class SubjectBoundOIDCProxy(OIDCProxy):
-    """Bridge FastMCP 3.2 verified claims to the MCP SDK session identity."""
+def _https_url(value: str, *, origin: bool = False) -> str:
+    """Require canonical server configuration, never normalize token issuers."""
+    try:
+        parsed = urlsplit(value)
+        canonical = str(AnyHttpUrl(value))
+        if (
+            not value or value != value.strip() or parsed.scheme != "https"
+            or not parsed.hostname or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment or "?" in value or "#" in value
+            or any(ord(c) <= 32 or ord(c) == 127 for c in value)
+            or (origin and parsed.path != "")
+            or canonical != value + ("/" if parsed.path == "" else "")
+        ):
+            raise ValueError
+    except (TypeError, ValueError) as exc:
+        raise AuthenticationConfigurationError("Hosted HTTPS URL is invalid") from exc
+    return value
 
-    async def load_access_token(self, token: str) -> AccessToken | None:
-        verified = await super().load_access_token(token)
+
+class HardenedAuthKitProvider(AuthKitProvider):
+    """Direct AuthKit resource server with Phase 6 time and identity guards.
+
+    No client secret, reference tokens, refresh mediation or OAuth state store.
+    Keep the default trusted JWTVerifier and its audience auto-binding; a custom
+    verifier argument is deliberately not exposed by this hosted adapter.
+    """
+
+    def __init__(self, *, issuer: str, base_url: str, audience: str,
+                 required_scopes: list[str]):
+        self.expected_issuer = _https_url(issuer, origin=True)
+        self.expected_audience = _https_url(audience)
+        _https_url(base_url, origin=True)
+        if not audience.startswith(base_url + "/") or audience == base_url + "/":
+            raise AuthenticationConfigurationError("Resource must include the MCP endpoint path")
+        if not required_scopes or any(
+            not isinstance(scope, str) or not re.fullmatch(r"[\x21\x23-\x5b\x5d-\x7e]+", scope)
+            for scope in required_scopes
+        ):
+            raise AuthenticationConfigurationError("Hosted scopes are required")
+        super().__init__(authkit_domain=issuer, base_url=base_url,
+                         required_scopes=list(required_scopes))
+        # Pin even before http_app()/get_routes() is called; never have an
+        # audience-free validation window during construction.
+        self.token_verifier.audience = audience
+
+    def set_mcp_path(self, mcp_path: str | None) -> None:
+        if str(self._get_resource_url(mcp_path)) != self.expected_audience:
+            raise AuthenticationConfigurationError("MCP endpoint and configured resource disagree")
+        super().set_mcp_path(mcp_path)
+
+    def get_routes(self, mcp_path: str | None = None) -> list[Route]:
+        routes = super().get_routes(mcp_path)
+
+        async def metadata(request):
+            # AnyHttpUrl serializes a root issuer with a trailing slash. Emit
+            # our exact configured issuer instead, without changing JWT claims
+            # or the canonical principal algorithm.
+            return JSONResponse({
+                "resource": self.expected_audience,
+                "authorization_servers": [self.expected_issuer],
+                "scopes_supported": self.token_verifier.scopes_supported,
+                "bearer_methods_supported": ["header"],
+            })
+
+        return [
+            Route(route.path, endpoint=cors_middleware(metadata, ["GET", "OPTIONS"]),
+                  methods=["GET", "OPTIONS"])
+            if route.path.startswith("/.well-known/oauth-protected-resource") else route
+            for route in routes
+        ]
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        try:
+            verified = await super().verify_token(token)
+        except Exception:
+            # Includes malformed NumericDate overflow and JWKS/network errors.
+            # No token or exception text is exposed; never fall back to anonymous.
+            return None
         if verified is None:
             return None
-        # All token-swap/refresh paths have completed signature, issuer, audience
-        # and scope verification. Reject invalid time claims before binding the
-        # SDK subject, creating a principal, or establishing session ownership.
+        # The trusted verifier has checked signature/issuer/audience/scopes.
+        # This gate only sees verified claims, including newly refreshed tokens.
         if not _valid_time_claims(verified.claims):
             return None
         issuer = verified.claims.get("iss")
         subject = verified.claims.get("sub")
-        audience = os.environ.get("ALPACA_MCP_OIDC_AUDIENCE", "")
         if (
-            not isinstance(issuer, str) or not issuer or issuer != issuer.strip()
+            issuer != self.expected_issuer
             or not isinstance(subject, str) or not subject or subject != subject.strip()
-            or not audience or audience != audience.strip()
-            or not _audience_matches(verified.claims.get("aud"), audience)
+            or not _audience_matches(verified.claims.get("aud"), self.expected_audience)
         ):
             return None
         # FastMCP 3.2.4 leaves the SDK's new subject field UNSET. Only bridge
@@ -107,35 +183,16 @@ def _required(name: str) -> str:
 
 
 def build_managed_oidc_provider() -> AuthProvider:
-    """Build FastMCP's managed OIDC proxy without exposing configuration values."""
+    """Build direct AuthKit auth. Kept under its existing factory API name."""
     try:
         scopes = _required("ALPACA_MCP_OAUTH_SCOPES").split()
         if not scopes:
             raise AuthenticationConfigurationError("Hosted OAuth configuration is incomplete")
-        client_storage = PostgreSQLStore(
-            url=_required("DATABASE_URL"),
-            table_name="safe_v2_oauth_state",
-        )
-        audience = _required("ALPACA_MCP_OIDC_AUDIENCE")
-        return SubjectBoundOIDCProxy(
-            config_url=_required("ALPACA_MCP_OIDC_CONFIG_URL"),
-            client_id=_required("ALPACA_MCP_OIDC_CLIENT_ID"),
-            client_secret=_required("ALPACA_MCP_OIDC_CLIENT_SECRET"),
-            audience=audience,
+        return HardenedAuthKitProvider(
+            issuer=_required("ALPACA_MCP_AUTHKIT_ISSUER"),
+            audience=_required("ALPACA_MCP_OIDC_AUDIENCE"),
             base_url=_required("ALPACA_MCP_PUBLIC_BASE_URL"),
             required_scopes=scopes,
-            verify_id_token=False,
-            redirect_path="/auth/callback",
-            # WorkOS uses RFC 8707 resource, not the OAuth client ID. Keep both
-            # authorization and token/refresh requests pinned to server configuration.
-            forward_resource=False,
-            extra_authorize_params={"resource": audience},
-            extra_token_params={"resource": audience},
-            client_storage=client_storage,
-            jwt_signing_key=validate_secret(
-                _required("ALPACA_MCP_JWT_SIGNING_KEY"), "Hosted JWT signing key"
-            ),
-            require_authorization_consent=True,
         )
     except AuthenticationConfigurationError:
         raise

@@ -7,7 +7,6 @@ No hand-crafted tool functions except for overrides (e.g., order placement).
 
 from __future__ import annotations
 
-import hmac
 import json
 import os
 from collections.abc import AsyncIterator
@@ -185,9 +184,8 @@ def build_server(
         ownership_secret = validate_secret(
             os.environ.get("ALPACA_SAFE_OWNERSHIP_SECRET", ""), "Safe ownership secret"
         )
-        jwt_secret = os.environ.get("ALPACA_MCP_JWT_SIGNING_KEY", "")
-        if jwt_secret and hmac.compare_digest(ownership_secret, jwt_secret):
-            raise AuthenticationConfigurationError("Hosted secrets must be independently configured")
+        if risk_store is None and not os.environ.get("DATABASE_URL", "").strip():
+            raise AuthenticationConfigurationError("Hosted risk database is required")
     else:
         principal_provider = principal_provider or local_principal_provider(
             os.environ.get("ALPACA_SAFE_PRINCIPAL", "")

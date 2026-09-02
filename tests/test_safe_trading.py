@@ -677,11 +677,15 @@ async def test_hosted_mode_ignores_safe_mode_false(monkeypatch):
         tool.name
         for tool in await build_server(
             hosted_mode=True,
+            risk_store=FakeStore(),
             auth_provider=verifier,
             principal_provider=lambda: "principal-a",
         ).list_tools()
     }
     assert "safe_place_stock_order" in names and "place_stock_order" not in names
+    assert {name for name in names if name.startswith("safe_")} == {
+        "safe_place_stock_order", "safe_place_crypto_order", "safe_cancel_order",
+    }
 
 
 @pytest.mark.asyncio

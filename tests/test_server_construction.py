@@ -38,7 +38,7 @@ DUMMY_ENV = {
     "ALPACA_API_KEY": "test-key",
     "ALPACA_SECRET_KEY": "test-secret",
     "ALPACA_PAPER_TRADE": "true",
-    # These legacy construction assertions intentionally cover upstream mode.
+    # V2 must remain Safe even with this obsolete setting.
     "ALPACA_SAFE_MODE": "false",
 }
 
@@ -46,7 +46,6 @@ EXPECTED_TOOLS = {
     # Account
     "get_account_info",
     "get_account_config",
-    "update_account_config",
     "get_portfolio_history",
     "get_account_activities",
     "get_account_activities_by_type",
@@ -54,24 +53,12 @@ EXPECTED_TOOLS = {
     "get_orders",
     "get_order_by_id",
     "get_order_by_client_id",
-    "replace_order_by_id",
-    "cancel_order_by_id",
-    "cancel_all_orders",
     # Trading: Positions
     "get_all_positions",
     "get_open_position",
-    "close_position",
-    "close_all_positions",
-    "exercise_options_position",
-    "do_not_exercise_options_position",
     # Watchlists
     "get_watchlists",
-    "create_watchlist",
     "get_watchlist_by_id",
-    "update_watchlist_by_id",
-    "delete_watchlist_by_id",
-    "add_asset_to_watchlist_by_id",
-    "remove_asset_from_watchlist_by_id",
     # Assets & Market Info
     "get_all_assets",
     "get_asset",
@@ -116,13 +103,12 @@ EXPECTED_TOOLS = {
     "get_fixed_income_latest_quotes",
     # Locates (Short Selling)
     "get_locates",
-    "create_locate",
     "get_locate",
     "get_locate_quotes",
     # Order Overrides
-    "place_stock_order",
-    "place_crypto_order",
-    "place_option_order",
+    "safe_place_stock_order",
+    "safe_place_crypto_order",
+    "safe_cancel_order",
     # ReadMe Docs
     "search_alpaca_docs",
     "fetch_alpaca_doc",
@@ -359,9 +345,9 @@ def test_strip_openapi_vendor_extensions_recursively():
 
 
 async def test_tool_count():
-    """Server must expose exactly 72 tools."""
+    """V2 exposes 55 read-only tools and exactly three Safe writes."""
     tools = await _list_tools()
-    assert len(tools) == 72, f"Expected 72 tools, got {len(tools)}"
+    assert len(tools) == 58, f"Expected 58 tools, got {len(tools)}"
 
 
 async def test_tool_names_match():
@@ -660,7 +646,7 @@ def test_readme_mcp_url_is_pinned_to_us_project():
 async def test_order_tools_have_destructive_hint():
     """Order placement tools must be annotated as destructive."""
     tools = await _list_tools()
-    order_tools = [t for t in tools if t.name.startswith("place_")]
+    order_tools = [t for t in tools if t.name.startswith("safe_")]
     assert len(order_tools) == 3
     for t in order_tools:
         annotations = t.annotations

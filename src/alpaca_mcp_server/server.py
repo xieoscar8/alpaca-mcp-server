@@ -17,19 +17,25 @@ from typing import Any
 
 import httpx
 from fastmcp import FastMCP
+from fastmcp.server.auth import AuthProvider
 from fastmcp.server.providers.openapi.routing import MCPType
 
+from .authentication import (
+    AuthenticationConfigurationError,
+    PrincipalProvider,
+    authenticated_principal,
+    build_managed_oidc_provider,
+    local_principal_provider,
+    validate_secret,
+)
 from .readme_docs import ReadMeClientFactory, register_readme_docs_tools
+from .risk_store import PostgresRiskStore, RiskStore, UnavailableRiskStore
 from .security import TrustBoundaryMiddleware
 from .tool_registry import TOOL_DESCRIPTIONS, TOOL_NAMES
 from .toolsets import OVERRIDE_OPERATION_IDS, TOOLSETS, get_active_operations
 
 SPECS_DIR = Path(__file__).parent / "specs"
 
-TRADING_API_BASE_URLS = {
-    "paper": "https://paper-api.alpaca.markets",
-    "live": "https://api.alpaca.markets",
-}
 MARKET_DATA_BASE_URL = "https://data.alpaca.markets"
 
 
@@ -60,8 +66,7 @@ def _strip_openapi_vendor_extensions(value: Any) -> Any:
                 cleaned[key] = item
             elif key in _OPENAPI_NAMED_MAP_FIELDS and isinstance(item, dict):
                 cleaned[key] = {
-                    name: _strip_openapi_vendor_extensions(entry)
-                    for name, entry in item.items()
+                    name: _strip_openapi_vendor_extensions(entry) for name, entry in item.items()
                 }
             else:
                 cleaned[key] = _strip_openapi_vendor_extensions(item)
@@ -98,9 +103,9 @@ def _get_read_operation_ids(spec: dict[str, Any]) -> set[str]:
     }
 
 
-def _safe_mode_enabled() -> bool:
-    """Safe mode is on unless it is explicitly disabled with ``false``."""
-    return os.environ.get("ALPACA_SAFE_MODE", "true").strip().lower() != "false"
+def _safe_mode_enabled(*, hosted_mode: bool = False) -> bool:
+    """V2 never registers legacy writes, including stdio."""
+    return True
 
 
 def _make_customizer(descriptions: dict[str, str]):
@@ -129,8 +134,9 @@ def _build_auth_headers() -> dict[str, str]:
 
 
 def _get_trading_base_url() -> str:
-    paper = os.environ.get("ALPACA_PAPER_TRADE", "true").lower() in ("true", "1", "yes")
-    return TRADING_API_BASE_URLS["paper" if paper else "live"]
+    from .paper import require_paper
+
+    return require_paper()
 
 
 def _ensure_scheme(url: str) -> str:
@@ -156,17 +162,38 @@ def _make_api_client(base_url: str, headers: dict[str, str]) -> httpx.AsyncClien
 
 def build_server(
     readme_client_factory: ReadMeClientFactory | None = None,
+    risk_store: RiskStore | None = None,
+    *,
+    hosted_mode: bool = False,
+    auth_provider: AuthProvider | None = None,
+    principal_provider: PrincipalProvider | None = None,
 ) -> FastMCP:
     """Construct the Alpaca MCP server from OpenAPI specs."""
     active_toolsets = _parse_toolsets()
     spec_ops = get_active_operations(active_toolsets)
-    safe_mode = _safe_mode_enabled()
+    safe_mode = _safe_mode_enabled(hosted_mode=hosted_mode)
+    ownership_secret: str | None = None
+    if hosted_mode:
+        auth_provider = auth_provider or build_managed_oidc_provider()
+        principal_provider = principal_provider or authenticated_principal
+        ownership_secret = validate_secret(
+            os.environ.get("ALPACA_SAFE_OWNERSHIP_SECRET", ""), "Safe ownership secret"
+        )
+        if risk_store is None and not os.environ.get("DATABASE_URL", "").strip():
+            raise AuthenticationConfigurationError("Hosted risk database is required")
+    else:
+        principal_provider = principal_provider or local_principal_provider(
+            os.environ.get("ALPACA_SAFE_PRINCIPAL", "")
+        )
 
     auth_headers = _build_auth_headers()
-    trading_base = _get_trading_base_url()
+    trading_base = _get_trading_base_url() if "trading" in spec_ops or hosted_mode else None
     data_base = _ensure_scheme(os.environ.get("DATA_API_URL", MARKET_DATA_BASE_URL)).rstrip("/")
 
     clients: list[httpx.AsyncClient] = []
+    if risk_store is None:
+        database_url = os.environ.get("DATABASE_URL", "")
+        risk_store = PostgresRiskStore(database_url) if database_url else UnavailableRiskStore()
 
     trading_client: httpx.AsyncClient | None = None
     if "trading" in spec_ops:
@@ -181,12 +208,25 @@ def build_server(
     @asynccontextmanager
     async def lifespan(_server: FastMCP) -> AsyncIterator[dict]:
         try:
+            await risk_store.open()
+            if trading_client is not None and safe_mode:
+                from .reconciliation import reconcile_pending
+                from .safe_overrides import _proof
+
+                ownership_secret = os.environ.get("ALPACA_SAFE_OWNERSHIP_SECRET", "")
+                if ownership_secret:
+                    await reconcile_pending(
+                        trading_client,
+                        risk_store,
+                        ownership_proof=lambda operation: _proof(operation, ownership_secret),
+                    )
             yield {}
         finally:
+            await risk_store.close()
             for c in clients:
                 await c.aclose()
 
-    main = FastMCP("Alpaca MCP Server", lifespan=lifespan)
+    main = FastMCP("Alpaca MCP Server", lifespan=lifespan, auth=auth_provider)
     main.add_middleware(TrustBoundaryMiddleware())
 
     if trading_client is not None:
@@ -222,10 +262,9 @@ def build_server(
     active_ts = active_toolsets if active_toolsets is not None else set(TOOLSETS.keys())
 
     if trading_client is not None and "trading" in active_ts:
-        if safe_mode:
-            _register_safe_trading_overrides(main, trading_client)
-        else:
-            _register_trading_overrides(main, trading_client)
+        _register_safe_trading_overrides(
+            main, trading_client, risk_store, principal_provider, ownership_secret
+        )
 
     if data_client is not None and active_ts & {"stock-data", "crypto-data"}:
         _register_market_data_overrides(main, data_client)
@@ -235,18 +274,27 @@ def build_server(
     return main
 
 
-def _register_trading_overrides(server: FastMCP, trading_client: httpx.AsyncClient) -> None:
-    """Register hand-crafted override tools for complex trading endpoints."""
-    from .overrides import register_order_tools
-
-    register_order_tools(server, trading_client)
-
-
-def _register_safe_trading_overrides(server: FastMCP, trading_client: httpx.AsyncClient) -> None:
-    """Register the only write tools permitted by Safe Trading V1."""
+def _register_safe_trading_overrides(
+    server: FastMCP,
+    trading_client: httpx.AsyncClient,
+    risk_store: RiskStore,
+    principal_provider: PrincipalProvider,
+    ownership_secret: str | None = None,
+) -> None:
+    """Register the only write tools permitted by Safe Trading V2."""
     from .safe_overrides import register_safe_trading_tools
 
-    register_safe_trading_tools(server, trading_client)
+    register_safe_trading_tools(
+        server,
+        trading_client,
+        risk_store,
+        principal_provider=principal_provider,
+        ownership_secret=(
+            ownership_secret
+            if ownership_secret is not None
+            else os.environ.get("ALPACA_SAFE_OWNERSHIP_SECRET", "")
+        ),
+    )
 
 
 def _register_market_data_overrides(server: FastMCP, data_client: httpx.AsyncClient) -> None:

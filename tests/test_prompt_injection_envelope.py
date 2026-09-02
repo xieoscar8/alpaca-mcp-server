@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 import os
 import threading
+import httpx
+import pytest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
@@ -20,6 +22,14 @@ from fastmcp.client import Client
 from alpaca_mcp_server.readme_docs import README_DOC_TOOL_NAMES
 from alpaca_mcp_server.security import DATA_KEY, INSTRUCTIONS, SECURITY_KEY
 from alpaca_mcp_server.server import build_server
+
+
+@pytest.fixture(autouse=True)
+def local_http_only(monkeypatch):
+    def client(base_url, headers):
+        assert httpx.URL(base_url).host == "127.0.0.1"
+        return httpx.AsyncClient(base_url=base_url, headers=headers, trust_env=False)
+    monkeypatch.setattr("alpaca_mcp_server.server._make_api_client", client)
 
 INJECTED_HEADLINE = (
     "Apple Shares Edge Higher as Services Growth Offsets Hardware Margin Concerns"

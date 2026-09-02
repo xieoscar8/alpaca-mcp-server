@@ -30,6 +30,38 @@ ORDER = "123e4567-e89b-42d3-a456-426614174000"
 LIMITS = RiskLimits(5, Decimal(300), Decimal(500), Decimal(200))
 
 
+@pytest.mark.asyncio
+async def test_cancel_ack_real_ledger_reconnect_terminal_daily_budget(store, monkeypatch):
+    from types import SimpleNamespace
+    from alpaca_mcp_server.reconciliation import reconcile_pending
+    from alpaca_mcp_server.safe_overrides import _proof
+    from test_safe_trading import make_tools, place, ORDER_1
+
+    monkeypatch.setattr("alpaca_mcp_server.authentication.get_access_token",
+                        lambda: SimpleNamespace(claims={"permissions": ["paper-trading"]}))
+    tools, client, _ = make_tools(store=store)
+    assert "error" not in await place(tools)
+    row = (await store.list_reconcilable())[0]
+    client.get_payload = {"id": ORDER_1, "client_order_id": row.client_order_id,
+                          "symbol": row.symbol, "status": "pending_cancel"}
+    assert (await tools["safe_cancel_order"](ORDER_1, row.strategy_id))["status"] == "cancel_uncertain"
+    await store.close()
+    await store.open()
+    def proof(op):
+        return _proof(op, "test-secret-not-production")
+    await reconcile_pending(client, store, ownership_proof=proof)
+    current = await store.get_by_client_order_id(row.client_order_id)
+    assert current.status == "cancel_uncertain" and current.reserved_notional == Decimal(50)
+    with pytest.raises(RiskLimitExceeded):
+        await reserve(store, 99, limits=RiskLimits(1, Decimal(300), Decimal(500), Decimal(200)))
+    client.get_payload["status"] = "canceled"
+    await reconcile_pending(client, store, ownership_proof=proof)
+    current = await store.get_by_client_order_id(row.client_order_id)
+    assert current.status == "cancelled" and current.reserved_notional == 0
+    with pytest.raises(RiskLimitExceeded):
+        await reserve(store, 100, limits=RiskLimits(5, Decimal(300), Decimal(50), Decimal(200)))
+
+
 @pytest_asyncio.fixture
 async def store():
     admin = await asyncpg.connect(DSN)

@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+import httpx
 
 import pytest
 from fastmcp import FastMCP
@@ -32,6 +33,8 @@ CALLS = [
 
 def register(server):
     broker, store, principal = Mock(), Mock(), Mock(return_value="principal-a")
+    broker.base_url = httpx.URL("https://paper-api.alpaca.markets/")
+    broker.follow_redirects = False
     register_safe_trading_tools(server, broker, store, principal_provider=principal,
                                 ownership_secret="synthetic-test-only")
     return broker, store, principal

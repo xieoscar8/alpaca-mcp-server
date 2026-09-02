@@ -14,6 +14,7 @@ import httpx
 from fastmcp import FastMCP
 
 from .authentication import PrincipalError, PrincipalProvider, has_paper_trading_permission
+from .paper import paper_client, paper_enabled
 from .reconciliation import reconcile_pending
 from .risk_store import Operation, RiskLimitExceeded, RiskLimits, RiskStore, RiskStoreError
 
@@ -32,7 +33,7 @@ OWNER_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
 def _paper() -> bool:
-    return os.environ.get("ALPACA_PAPER_TRADE", "").strip().lower() in {"true", "1", "yes"}
+    return paper_enabled()
 
 
 def _error(message: str, **extra: object) -> dict:
@@ -46,7 +47,11 @@ def _error(message: str, **extra: object) -> dict:
 
 
 def _number(value: object, field: str) -> tuple[Decimal | None, dict | None]:
-    text = str(value)
+    if not isinstance(value, str) or not 1 <= len(value) <= 64 or not value.isascii():
+        return None, _error(f"{field} must be a bounded decimal string")
+    text = value
+    if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?", text) is None:
+        return None, _error(f"{field} must be a valid positive decimal")
     if text != text.strip():
         return None, _error(f"{field} must not contain surrounding whitespace")
     try:
@@ -55,6 +60,10 @@ def _number(value: object, field: str) -> tuple[Decimal | None, dict | None]:
         return None, _error(f"{field} must be a valid positive decimal")
     if not number.is_finite() or number <= 0:
         return None, _error(f"{field} must be a finite positive decimal")
+    if len(number.as_tuple().digits) > 12 or not -12 <= number.as_tuple().exponent <= 12:
+        return None, _error(f"{field} exceeds decimal precision or exponent bounds")
+    if not -12 <= number.adjusted() <= 12:
+        return None, _error(f"{field} exceeds decimal magnitude bounds")
     return number, None
 
 
@@ -91,7 +100,7 @@ def _limits() -> RiskLimits:
 
 
 def _symbol(value: object, crypto: bool) -> bool:
-    if not isinstance(value, str) or not value or value != value.strip() or not value.isprintable():
+    if not isinstance(value, str) or not 1 <= len(value) <= 32 or value != value.strip() or not value.isprintable():
         return False
     return (CRYPTO_RE if crypto else STOCK_RE).fullmatch(value) is not None
 
@@ -102,7 +111,8 @@ def _canonical_symbol(value: str) -> str:
 
 
 def _decimal_text(value: Decimal) -> str:
-    return format(value.normalize(), "f")
+    text = format(value, "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
 
 
 def _request_fingerprint(*, body: dict[str, str], asset_type: str) -> str:
@@ -144,6 +154,8 @@ def _replay(operation: Operation) -> dict:
 async def _post(
     client: httpx.AsyncClient, store: RiskStore, body: dict, operation: Operation
 ) -> dict:
+    if not paper_client(client):
+        return _error("Safe Trading requires a verified Paper transport")
     try:
         response = await client.post("/v2/orders", json=body)
     except httpx.RequestError:
@@ -228,6 +240,8 @@ async def _reserve(
 ) -> dict:
     if not _owner_field(strategy) or not _owner_field(key):
         return _error("strategy_id and idempotency_key must be 1-64 safe characters")
+    if not paper_client(client):
+        return _error("Safe Trading requires a verified Paper transport")
     try:
         principal = principal_provider()
     except PrincipalError:
@@ -296,7 +310,7 @@ def register_safe_trading_tools(
         """Place a V2-owned cumulative-risk-limited stock order."""
         if not has_paper_trading_permission():
             return _error("Safe Trading requires paper-trading permission")
-        if not _paper():
+        if not paper_client(client):
             return _error("Safe Trading V2 write operations are Paper-only.")
         if not _symbol(symbol, False):
             return _error("Invalid single stock symbol")
@@ -329,6 +343,26 @@ def register_safe_trading_tools(
             "limit_price": _decimal_text(price),
             "qty" if qty is not None else "notional": _decimal_text(amount),
         }
+        # Read-only asset proof precedes reconciliation and reservation.
+        if re.fullmatch(r"[A-Z0-9.]+[0-9]{6}[CP][0-9]{8}", symbol):
+            return _error("Options are not allowed by the stock tool")
+        try:
+            asset_response = await client.get(f"/v2/assets/{quote(symbol, safe='')}")
+            if asset_response.status_code != 200:
+                return _error("Equity asset verification failed")
+            asset = asset_response.json()
+            if (
+                not isinstance(asset, dict)
+                or asset.get("symbol") != symbol
+                or asset.get("class", asset.get("asset_class")) != "us_equity"
+                or ("class" in asset and asset["class"] != "us_equity")
+                or ("asset_class" in asset and asset["asset_class"] != "us_equity")
+                or asset.get("tradable") is not True
+                or asset.get("status") != "active"
+            ):
+                return _error("A verified active tradable equity is required")
+        except (httpx.RequestError, ValueError, TypeError):
+            return _error("Equity asset verification failed")
         return await _reserve(
             client=client,
             store=store,
@@ -358,7 +392,7 @@ def register_safe_trading_tools(
         """Place a V2-owned cumulative-risk-limited crypto order."""
         if not has_paper_trading_permission():
             return _error("Safe Trading requires paper-trading permission")
-        if not _paper():
+        if not paper_client(client):
             return _error("Safe Trading V2 write operations are Paper-only.")
         if not _symbol(symbol, True):
             return _error("Invalid single crypto pair")
@@ -410,7 +444,7 @@ def register_safe_trading_tools(
         """Cancel one order proven to belong to this principal and strategy."""
         if not has_paper_trading_permission():
             return _error("Safe Trading requires paper-trading permission")
-        if not _paper():
+        if not paper_client(client):
             return _error("Safe Trading V2 write operations are Paper-only.")
         if not ORDER_ID_RE.fullmatch(order_id):
             return _error("A single order UUID is required")
@@ -427,7 +461,7 @@ def register_safe_trading_tools(
             response = await client.get(path)
         except httpx.RequestError:
             return _error("Order pre-check timed out")
-        if response.is_error:
+        if response.status_code != 200:
             return _error("Order pre-check failed")
         try:
             fetched = response.json()
@@ -445,6 +479,8 @@ def register_safe_trading_tools(
             return _error("Ownership lookup failed")
         if operation is None or not _proof(operation, ownership_secret):
             return _error("Ownership proof invalid")
+        if fetched.get("symbol") != operation.symbol:
+            return _error("Alpaca and ownership symbols mismatch")
         if operation.principal != principal or operation.strategy_id != strategy_id:
             return _error("Order belongs to another principal or strategy")
         if operation.status == "uncertain" and operation.order_id is None:
@@ -460,6 +496,8 @@ def register_safe_trading_tools(
             await store.begin_cancel(client_id)
         except RiskStoreError:
             return _error("Cancellation reservation failed; DELETE was not sent")
+        if not paper_client(client):
+            return _error("Safe Trading requires a verified Paper transport")
         try:
             deleted = await client.delete(path)
         except httpx.RequestError:
@@ -476,12 +514,13 @@ def register_safe_trading_tools(
             except RiskStoreError:
                 return _error("Cancellation rejection persistence failed", uncertain=True)
             return _error("API rejected cancellation", http_status=deleted.status_code)
-        try:
-            await store.mark_cancelled(client_id)
-        except RiskStoreError:
-            return _error("Cancellation succeeded but persistence failed", uncertain=True)
+        if deleted.status_code != 204:
+            return _error("Cancellation outcome is unconfirmed", uncertain=True)
+        # Only later broker-verified reconciliation may release reserved risk.
         return {
-            "result": {"cancelled_order_id": order_id},
+            "result": {"cancel_requested_order_id": order_id},
+            "status": "cancel_uncertain",
+            "uncertain": True,
             "safe_mode": True,
             "safe_trading_version": "v2",
             "paper_trade": True,

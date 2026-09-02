@@ -53,6 +53,9 @@ class CaptureServer:
 
 class FakeClient:
     def __init__(self):
+        self.base_url = httpx.URL("https://paper-api.alpaca.markets/")
+        self.follow_redirects = False
+        self.asset_calls = []
         self.calls = []
         self.post_timeout = False
         self.delete_timeout = False
@@ -72,6 +75,10 @@ class FakeClient:
         return httpx.Response(self.post_status, content=json.dumps(payload).encode())
 
     async def get(self, path, **kwargs):
+        if path.startswith("/v2/assets/"):
+            self.asset_calls.append(path)
+            return httpx.Response(200, json={"symbol": path.rsplit("/", 1)[-1],
+                "class": "us_equity", "tradable": True, "status": "active"})
         self.calls.append(("GET", path, kwargs))
         if self.get_timeout:
             raise httpx.ReadTimeout("timeout")
@@ -468,11 +475,11 @@ async def test_restart_reconciles_uncertain_owned_order_for_cancel():
     timeout = await place(first)
     client_id = timeout["client_order_id"]
     restarted, client2, store2 = make_tools(store=FakeStore(shared))
-    client2.get_payload = {"id": ORDER_1, "client_order_id": client_id}
+    client2.get_payload = {"id": ORDER_1, "client_order_id": client_id, "symbol": "AAPL"}
     result = await restarted["safe_cancel_order"](ORDER_1, "strategy-1")
     assert "error" not in result
     assert [c[0] for c in client2.calls] == ["GET", "DELETE"]
-    assert store2.rows[client_id].status == "cancelled"
+    assert store2.rows[client_id].status == "cancel_uncertain"
 
 
 async def owned_order():
@@ -480,7 +487,7 @@ async def owned_order():
     await place(tools)
     row = next(iter(store.rows.values()))
     client.calls.clear()
-    client.get_payload = {"id": ORDER_1, "client_order_id": row.client_order_id}
+    client.get_payload = {"id": ORDER_1, "client_order_id": row.client_order_id, "symbol": row.symbol}
     return tools, client, store, row
 
 
@@ -547,7 +554,7 @@ async def test_valid_owned_cancel_deletes_once():
     tools, client, store, row = await owned_order()
     result = await tools["safe_cancel_order"](ORDER_1, "strategy-1")
     assert "error" not in result and [c[0] for c in client.calls] == ["GET", "DELETE"]
-    assert store.rows[row.client_order_id].status == "cancelled"
+    assert store.rows[row.client_order_id].status == "cancel_uncertain"
 
 
 @pytest.mark.asyncio
@@ -559,7 +566,7 @@ async def test_concurrent_owned_cancels_issue_one_delete():
     )
     assert sum("error" not in result for result in results) == 1
     assert [call[0] for call in client.calls].count("DELETE") == 1
-    assert store.rows[row.client_order_id].status == "cancelled"
+    assert store.rows[row.client_order_id].status == "cancel_uncertain"
 
 
 @pytest.mark.asyncio

@@ -36,10 +36,6 @@ from .toolsets import OVERRIDE_OPERATION_IDS, TOOLSETS, get_active_operations
 
 SPECS_DIR = Path(__file__).parent / "specs"
 
-TRADING_API_BASE_URLS = {
-    "paper": "https://paper-api.alpaca.markets",
-    "live": "https://api.alpaca.markets",
-}
 MARKET_DATA_BASE_URL = "https://data.alpaca.markets"
 
 
@@ -108,10 +104,8 @@ def _get_read_operation_ids(spec: dict[str, Any]) -> set[str]:
 
 
 def _safe_mode_enabled(*, hosted_mode: bool = False) -> bool:
-    """Safe mode is on unless it is explicitly disabled with ``false``."""
-    if hosted_mode:
-        return True
-    return os.environ.get("ALPACA_SAFE_MODE", "true").strip().lower() != "false"
+    """V2 never registers legacy writes, including stdio."""
+    return True
 
 
 def _make_customizer(descriptions: dict[str, str]):
@@ -140,8 +134,9 @@ def _build_auth_headers() -> dict[str, str]:
 
 
 def _get_trading_base_url() -> str:
-    paper = os.environ.get("ALPACA_PAPER_TRADE", "true").lower() in ("true", "1", "yes")
-    return TRADING_API_BASE_URLS["paper" if paper else "live"]
+    from .paper import require_paper
+
+    return require_paper()
 
 
 def _ensure_scheme(url: str) -> str:
@@ -192,7 +187,7 @@ def build_server(
         )
 
     auth_headers = _build_auth_headers()
-    trading_base = _get_trading_base_url()
+    trading_base = _get_trading_base_url() if "trading" in spec_ops or hosted_mode else None
     data_base = _ensure_scheme(os.environ.get("DATA_API_URL", MARKET_DATA_BASE_URL)).rstrip("/")
 
     clients: list[httpx.AsyncClient] = []
@@ -267,12 +262,9 @@ def build_server(
     active_ts = active_toolsets if active_toolsets is not None else set(TOOLSETS.keys())
 
     if trading_client is not None and "trading" in active_ts:
-        if safe_mode:
-            _register_safe_trading_overrides(
-                main, trading_client, risk_store, principal_provider, ownership_secret
-            )
-        else:
-            _register_trading_overrides(main, trading_client)
+        _register_safe_trading_overrides(
+            main, trading_client, risk_store, principal_provider, ownership_secret
+        )
 
     if data_client is not None and active_ts & {"stock-data", "crypto-data"}:
         _register_market_data_overrides(main, data_client)
@@ -280,13 +272,6 @@ def build_server(
     register_readme_docs_tools(main, client_factory=readme_client_factory)
 
     return main
-
-
-def _register_trading_overrides(server: FastMCP, trading_client: httpx.AsyncClient) -> None:
-    """Register hand-crafted override tools for complex trading endpoints."""
-    from .overrides import register_order_tools
-
-    register_order_tools(server, trading_client)
 
 
 def _register_safe_trading_overrides(

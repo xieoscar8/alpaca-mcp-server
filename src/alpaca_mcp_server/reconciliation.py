@@ -58,7 +58,7 @@ async def reconcile_pending(
         except httpx.RequestError:
             summary["quarantined"] += 1
             continue
-        if response.status_code == 404 or response.is_error:
+        if response.status_code != 200:
             summary["quarantined"] += 1
             continue
         try:

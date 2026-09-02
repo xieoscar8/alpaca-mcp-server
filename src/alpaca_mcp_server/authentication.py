@@ -32,7 +32,7 @@ PrincipalProvider = Callable[[], str]
 
 
 def has_paper_trading_permission() -> bool:
-    """Authorize only from this request's verified token permissions snapshot.
+    """Authorize from verified native permissions or exact signed alpaca_role.
 
     Role changes require refreshed claims; this is not immediate revocation.
     Missing context, including local/stdio calls, never grants write permission.
@@ -41,6 +41,10 @@ def has_paper_trading_permission() -> bool:
         token = get_access_token()
         if token is None or not isinstance(token.claims, dict):
             return False
+        # Independent signed-role capability; never normalize or coerce it.
+        alpaca_role = token.claims.get("alpaca_role")
+        if isinstance(alpaca_role, str) and alpaca_role == "paper-trader":
+            return True
         permissions = token.claims.get("permissions")
         return (
             isinstance(permissions, list)

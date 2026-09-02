@@ -159,7 +159,7 @@ async def test_not_registered_on_unauthenticated_local_server(monkeypatch):
     (1.5, "other_or_invalid"), (True, "other_or_invalid"),
     (False, "other_or_invalid"), (None, "other_or_invalid"),
 ])
-def test_alpaca_role_allowlist_and_no_authorization(monkeypatch, caplog, capsys, value, expected):
+def test_alpaca_role_allowlist_and_capability(monkeypatch, caplog, capsys, value, expected):
     context = token({"alpaca_role": value, "sub": CANARY, "email": CANARY,
                      "sid": CANARY, "org_id": CANARY, "secret": CANARY})
     monkeypatch.setattr(diagnostic, "get_access_token", lambda: context)
@@ -168,7 +168,7 @@ def test_alpaca_role_allowlist_and_no_authorization(monkeypatch, caplog, capsys,
     assert result == {**EMPTY, "verified_context_present": True, "org_id_present": True,
                       "alpaca_role_present": True, "alpaca_role_value": expected}
     assert_fixed(result)
-    assert not authentication.has_paper_trading_permission()
+    assert authentication.has_paper_trading_permission() is (expected == "paper-trader")
     assert CANARY not in caplog.text
     captured = capsys.readouterr()
     assert CANARY not in captured.out + captured.err

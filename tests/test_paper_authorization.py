@@ -5,11 +5,13 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastmcp import FastMCP
+from fastmcp.server.auth.auth import AccessToken
 from starlette.testclient import TestClient
 
 from alpaca_mcp_server import authentication as auth
 from alpaca_mcp_server.readme_docs import README_DOC_TOOL_NAMES, register_readme_docs_tools
 from alpaca_mcp_server.safe_overrides import register_safe_trading_tools
+from alpaca_mcp_server.server import build_server
 from test_authkit_resource_server import signed  # noqa: F401
 from test_safe_trading import CaptureServer
 
@@ -47,6 +49,62 @@ async def test_denied_before_any_broker_ledger_or_principal_access(monkeypatch, 
     result = await server.tools[name](**args)
     assert "requires paper-trading permission" in result["error"]["message"]
     assert not broker.mock_calls and not store.mock_calls and not principal.mock_calls
+
+
+@pytest.mark.parametrize("permissions,allowed", [
+    (None, False), ([], False), ("paper-trading", False),
+    ({"paper-trading": True}, False), ([False], False), ([1], False),
+    ([None], False), ([[]], False), ([""], False), ([" paper-trading"], False),
+    (["paper-trading "], False), (["paper-trading", 1], False),
+    (["paper-trading", " "], False), (["synthetic-canary"], False),
+    (["Paper-Trading"], False), (["paper-trading-admin"], False),
+    (["paper-trading"], True), (["synthetic-canary", "paper-trading"], True),
+])
+def test_native_permission_contract_retained(monkeypatch, permissions, allowed):
+    context = AccessToken.model_construct(
+        token="synthetic-canary", client_id="synthetic-canary", scopes=[],
+        claims={"permissions": permissions},
+    )
+    monkeypatch.setattr(auth, "get_access_token", lambda: context)
+    assert auth.has_paper_trading_permission() is allowed
+
+
+@pytest.mark.parametrize("value,allowed", [
+    ("paper-trader", True), ("member", False), ("synthetic-canary", False),
+    ("", False), (" ", False), (" paper-trader", False),
+    ("paper-trader ", False), ("paper-trader\n", False),
+    ("Paper-Trader", False), ("PAPER-TRADER", False), ("Member", False),
+    (["synthetic-canary"], False), ({"role": "synthetic-canary"}, False),
+    (1, False), (1.5, False), (True, False), (False, False), (None, False),
+])
+def test_role_capability_and_no_sensitive_output_retained(monkeypatch, caplog, capsys, value, allowed):
+    canary = "synthetic-canary"
+    context = AccessToken.model_construct(
+        token=canary, client_id=canary, scopes=[],
+        claims={"alpaca_role": value, "sub": canary, "email": canary,
+                "sid": canary, "org_id": canary, "secret": canary},
+    )
+    monkeypatch.setattr(auth, "get_access_token", lambda: context)
+    assert auth.has_paper_trading_permission() is allowed
+    assert canary not in caplog.text
+    captured = capsys.readouterr()
+    assert canary not in captured.out + captured.err
+
+
+async def test_hosted_surface_matches_permanent_tool_surface(signed, monkeypatch):  # noqa: F811
+    provider, _, _ = signed
+    monkeypatch.setenv("ALPACA_TOOLSETS", "trading")
+    monkeypatch.setenv("ALPACA_SAFE_OWNERSHIP_SECRET", "synthetic-ownership-test-only-123456789")
+    network = AsyncMock(side_effect=AssertionError("network prohibited"))
+    monkeypatch.setattr("httpx.AsyncClient.send", network)
+    hosted = build_server(hosted_mode=True, auth_provider=provider, risk_store=Mock())
+    local = build_server(risk_store=Mock())
+    hosted_tools = await hosted.list_tools()
+    assert {t.name for t in hosted_tools} == {t.name for t in await local.list_tools()}
+    assert {t.name for t in hosted_tools if t.name.startswith("safe_")} == {
+        "safe_place_stock_order", "safe_place_crypto_order", "safe_cancel_order",
+    }
+    network.assert_not_called()
 
 
 @pytest.mark.parametrize("failure", [False, True])

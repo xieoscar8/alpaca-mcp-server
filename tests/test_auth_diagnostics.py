@@ -17,6 +17,7 @@ EMPTY = {
     "verified_context_present": False, "org_id_present": False,
     "role_present": False, "role_value": "absent", "permissions_present": False,
     "permissions_shape_valid": False, "paper_trading_present": False,
+    "alpaca_role_present": False, "alpaca_role_value": "absent",
 }
 CANARY = "sensitive-synthetic-canary-never-echo"
 
@@ -28,7 +29,9 @@ def token(claims):
 def assert_fixed(value):
     assert value.keys() == EMPTY.keys()
     assert value["role_value"] in {"member", "paper-trader", "other_or_invalid", "absent"}
-    assert all(type(v) is bool for k, v in value.items() if k != "role_value")
+    assert len(value) == 9
+    assert value["alpaca_role_value"] in {"member", "paper-trader", "other_or_invalid", "absent"}
+    assert all(type(v) is bool for k, v in value.items() if k not in {"role_value", "alpaca_role_value"})
     assert CANARY not in json.dumps(value)
 
 
@@ -106,7 +109,11 @@ def test_hosted_authenticated_context_and_zero_side_effects(signed, monkeypatch)
         monkeypatch.setattr(diagnostic, "get_access_token", getter)
         assert client.post("/mcp", json=request).status_code == 401
         getter.assert_not_called()
-        for claims, allowed in [({}, False), ({"permissions": ["paper-trading"]}, True), ({}, False)]:
+        for claims, allowed in [
+            ({}, False), ({"permissions": ["paper-trading"]}, True),
+            ({"alpaca_role": "paper-trader"}, False),
+            ({"alpaca_role": CANARY}, False), ({}, False),
+        ]:
             headers = {"Authorization": "Bearer " + sign({
                 "org_id": CANARY, "role": CANARY, "email": CANARY, **claims,
             }), "Accept": "application/json, text/event-stream"}
@@ -118,6 +125,11 @@ def test_hosted_authenticated_context_and_zero_side_effects(signed, monkeypatch)
             assert result["verified_context_present"]
             assert result["org_id_present"]
             assert result["paper_trading_present"] is allowed
+            assert result["alpaca_role_present"] is ("alpaca_role" in claims)
+            expected = "absent"
+            if "alpaca_role" in claims:
+                expected = "paper-trader" if claims["alpaca_role"] == "paper-trader" else "other_or_invalid"
+            assert result["alpaca_role_value"] == expected
         listing = client.post("/mcp", headers=headers, json={
             "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {},
         }).json()["result"]["tools"]
@@ -134,3 +146,44 @@ async def test_not_registered_on_unauthenticated_local_server(monkeypatch):
     monkeypatch.setenv("ALPACA_TOOLSETS", "trading")
     server = build_server()
     assert "debug_auth_claims_summary" not in {t.name for t in await server.list_tools()}
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("paper-trader", "paper-trader"), ("member", "member"),
+    (CANARY, "other_or_invalid"), ("", "other_or_invalid"),
+    (" ", "other_or_invalid"), (" paper-trader", "other_or_invalid"),
+    ("paper-trader ", "other_or_invalid"), ("paper-trader\n", "other_or_invalid"),
+    ("Paper-Trader", "other_or_invalid"), ("PAPER-TRADER", "other_or_invalid"),
+    ("Member", "other_or_invalid"), ([CANARY], "other_or_invalid"),
+    ({"role": CANARY}, "other_or_invalid"), (1, "other_or_invalid"),
+    (1.5, "other_or_invalid"), (True, "other_or_invalid"),
+    (False, "other_or_invalid"), (None, "other_or_invalid"),
+])
+def test_alpaca_role_allowlist_and_no_authorization(monkeypatch, caplog, capsys, value, expected):
+    context = token({"alpaca_role": value, "sub": CANARY, "email": CANARY,
+                     "sid": CANARY, "org_id": CANARY, "secret": CANARY})
+    monkeypatch.setattr(diagnostic, "get_access_token", lambda: context)
+    monkeypatch.setattr(authentication, "get_access_token", lambda: context)
+    result = diagnostic.auth_claims_summary()
+    assert result == {**EMPTY, "verified_context_present": True, "org_id_present": True,
+                      "alpaca_role_present": True, "alpaca_role_value": expected}
+    assert_fixed(result)
+    assert not authentication.has_paper_trading_permission()
+    assert CANARY not in caplog.text
+    captured = capsys.readouterr()
+    assert CANARY not in captured.out + captured.err
+
+
+def test_processing_exception_returns_entire_empty_summary(monkeypatch, caplog, capsys):
+    class BrokenClaims(dict):
+        def get(self, key, default=None):
+            if key == "alpaca_role":
+                raise RuntimeError(CANARY)
+            return super().get(key, default)
+
+    context = token(BrokenClaims(role="paper-trader", alpaca_role="paper-trader"))
+    monkeypatch.setattr(diagnostic, "get_access_token", lambda: context)
+    assert diagnostic.auth_claims_summary() == EMPTY
+    assert CANARY not in caplog.text
+    captured = capsys.readouterr()
+    assert CANARY not in captured.out + captured.err

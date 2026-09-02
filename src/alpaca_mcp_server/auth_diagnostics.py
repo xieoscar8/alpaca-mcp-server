@@ -15,6 +15,8 @@ def auth_claims_summary() -> dict[str, bool | str]:
         "permissions_present": False,
         "permissions_shape_valid": False,
         "paper_trading_present": False,
+        "alpaca_role_present": False,
+        "alpaca_role_value": "absent",
     }
     try:
         token = get_access_token()
@@ -30,6 +32,15 @@ def auth_claims_summary() -> dict[str, bool | str]:
                 role_value = "member"
             elif isinstance(role, str) and role == "paper-trader":
                 role_value = "paper-trader"
+        alpaca_role_present = "alpaca_role" in claims
+        alpaca_role = claims.get("alpaca_role")
+        alpaca_role_value = "absent"
+        if alpaca_role_present:
+            alpaca_role_value = "other_or_invalid"
+            if isinstance(alpaca_role, str) and alpaca_role == "paper-trader":
+                alpaca_role_value = "paper-trader"
+            elif isinstance(alpaca_role, str) and alpaca_role == "member":
+                alpaca_role_value = "member"
         permissions = claims.get("permissions")
         # Intentionally mirror the production gate without changing it.
         shape_valid = (
@@ -48,6 +59,8 @@ def auth_claims_summary() -> dict[str, bool | str]:
             "permissions_present": "permissions" in claims,
             "permissions_shape_valid": shape_valid,
             "paper_trading_present": shape_valid and "paper-trading" in permissions,
+            "alpaca_role_present": alpaca_role_present,
+            "alpaca_role_value": alpaca_role_value,
         }
     except Exception:
         return empty

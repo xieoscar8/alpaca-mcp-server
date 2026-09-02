@@ -234,6 +234,11 @@ def build_server(
     main = FastMCP("Alpaca MCP Server", lifespan=lifespan, auth=auth_provider)
     main.add_middleware(TrustBoundaryMiddleware())
 
+    if hosted_mode:
+        from .auth_diagnostics import register_auth_diagnostic_tool
+
+        register_auth_diagnostic_tool(main)
+
     if trading_client is not None:
         allowed = spec_ops["trading"]
         spec = _load_spec("trading-api")

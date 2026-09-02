@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
+import time
 from collections.abc import Callable
 
 from fastmcp.server.auth import AuthProvider, OIDCProxy
@@ -22,6 +24,38 @@ class PrincipalError(RuntimeError):
 
 PrincipalProvider = Callable[[], str]
 
+# Bound ordinary clock drift without granting minutes of premature token use.
+# Server-only policy: never sourced from request arguments or environment variables.
+JWT_CLOCK_SKEW_SECONDS = 60
+
+
+def _valid_time_claims(claims: dict) -> bool:
+    """Check only verified claims; do not decode or re-verify JWTs here.
+
+    The upstream verifier's stricter expiration check remains authoritative.
+    This additional gate never rescues a token rejected upstream. No maximum
+    lifetime is imposed: that requires a separate provider-backed policy.
+    """
+    now = time.time()
+    for name in ("exp", "nbf", "iat"):
+        if name not in claims:
+            if name == "exp":
+                return False
+            continue
+        value = claims[name]
+        # JSON NumericDate permits fractional seconds, not strings or booleans.
+        # Integers are finite without converting potentially huge ints to float.
+        if type(value) not in (int, float):
+            return False
+        if isinstance(value, float) and not math.isfinite(value):
+            return False
+        if name == "exp":
+            if now >= value + JWT_CLOCK_SKEW_SECONDS:
+                return False
+        elif value > now + JWT_CLOCK_SKEW_SECONDS:
+            return False
+    return True
+
 
 class SubjectBoundOIDCProxy(OIDCProxy):
     """Bridge FastMCP 3.2 verified claims to the MCP SDK session identity."""
@@ -29,6 +63,11 @@ class SubjectBoundOIDCProxy(OIDCProxy):
     async def load_access_token(self, token: str) -> AccessToken | None:
         verified = await super().load_access_token(token)
         if verified is None:
+            return None
+        # All token-swap/refresh paths have completed signature, issuer, audience
+        # and scope verification. Reject invalid time claims before binding the
+        # SDK subject, creating a principal, or establishing session ownership.
+        if not _valid_time_claims(verified.claims):
             return None
         issuer = verified.claims.get("iss")
         subject = verified.claims.get("sub")

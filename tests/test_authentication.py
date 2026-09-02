@@ -158,7 +158,8 @@ async def test_subject_bridge_rejects_explicit_invalid_subject(monkeypatch, subj
     from fastmcp.server.auth.auth import AccessToken
 
     value = AccessToken(token="test", client_id="same-client", scopes=[], subject=subject,
-                        claims={"iss": "https://issuer.example", "sub": "user-1", "aud": AUDIENCE})
+                        claims={"iss": "https://issuer.example", "sub": "user-1",
+                                "aud": AUDIENCE, "exp": time.time() + 300})
     monkeypatch.setenv("ALPACA_MCP_OIDC_AUDIENCE", AUDIENCE)
     monkeypatch.setattr(OIDCProxy, "load_access_token", AsyncMock(return_value=value))
     provider = object.__new__(authentication.SubjectBoundOIDCProxy)
@@ -174,7 +175,8 @@ async def test_subject_bridge_rejects_malformed_verified_claims(monkeypatch, ove
     from fastmcp.server.auth.auth import AccessToken
 
     value = AccessToken(token="test", client_id="same-client", scopes=[], claims={
-        "iss": "https://issuer.example", "sub": "user-1", "aud": AUDIENCE, **overrides,
+        "iss": "https://issuer.example", "sub": "user-1", "aud": AUDIENCE,
+        "exp": time.time() + 300, **overrides,
     })
     monkeypatch.setenv("ALPACA_MCP_OIDC_AUDIENCE", AUDIENCE)
     monkeypatch.setattr(OIDCProxy, "load_access_token", AsyncMock(return_value=value))
@@ -234,6 +236,18 @@ def test_stateful_session_binds_verified_user_not_only_oauth_client(
         for auth in ("", "Bearer invalid"):
             assert client.post("/mcp", headers={**headers, "Authorization": auth},
                                json=request).status_code == 401
+        # An existing session cannot authorize a newly presented invalid token,
+        # even when issuer, subject and client_id match the original user.
+        for invalid in ({"exp": int(time.time()) - 300}, {"exp": None},
+                        {"nbf": int(time.time()) + 300}, {"iat": int(time.time()) + 300}):
+            invalid_token = _signed_token(
+                private_key, sub="user-a", client_id="same-client",
+                scope="alpaca:read alpaca:safe-write", **invalid,
+            )
+            assert client.post(
+                "/mcp", headers={**headers, "Authorization": "Bearer " + invalid_token},
+                json=request,
+            ).status_code == 401
         assert client.post("/mcp", headers=headers, json=request).status_code == 200
 
 
